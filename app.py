@@ -998,9 +998,12 @@ def _sync_generation_pipeline(job_id: str, user_goal: str):
 
     except Exception as e:
         logger.exception(f"Job {job_id} failed")
+        detail = str(e)
+        if isinstance(e, subprocess.CalledProcessError) and e.stderr:
+            detail = f"{detail} | stderr: {e.stderr.strip()[:500]}"
         update_job(
             job_id, status="failed", current_step="error",
-            error=f"Orchestration failed: {type(e).__name__}",
+            error=f"Orchestration failed: {type(e).__name__}: {detail}",
         )
     finally:
         shutil.rmtree(job_workspace, ignore_errors=True)
