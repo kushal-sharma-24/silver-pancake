@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+oh-my-codex
+oh-my-openagent
+claw-code
