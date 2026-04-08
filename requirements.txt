@@ -2,3 +2,4 @@ fastapi
 uvicorn
 oh-my-codex
 openai-agents
+pydantic
