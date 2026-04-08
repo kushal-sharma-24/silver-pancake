@@ -20,8 +20,12 @@ async def handle_teams_message(request: Request):
     else:
         subprocess.run("cd workspace && git checkout develop && git pull", shell=True)
         
-    # Trigger the omx multi-agent team mode
+    # Trigger the agents and FORCE the server to wait for them to finish
     omx_command = f'cd workspace && omx team 3:executor "{clean_prompt}"'
-    subprocess.Popen(omx_command, shell=True, env=os.environ)
+    result = subprocess.run(omx_command, shell=True, env=os.environ, capture_output=True, text=True)
     
-    return {"type": "message", "text": "Agents deployed to the develop branch of silver-pancake. I'll open a PR when finished."}
+    # Return the actual live output from the agents instead of a static message
+    return {
+        "type": "message", 
+        "text": f"Execution Complete!\n\nAgent Output:\n{result.stdout}\n\nCheck GitHub for your PR."
+    }
