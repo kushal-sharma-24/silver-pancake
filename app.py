@@ -3,7 +3,9 @@ import re
 import json
 import uuid
 import time
-import hmac
+imac
+import base64
+import base64
 import hashlib
 import shutil
 import asyncio
@@ -40,6 +42,13 @@ if not GEMINI_KEY or not GITHUB_PAT or not WEBHOOK_SECRET:
     raise RuntimeError(
         "Critical env vars missing: GEMINI_API_KEY, GITHUB_TOKEN, WEBHOOK_SECRET"
     )
+
+# GitHub git HTTPS uses Basic auth (not Bearer).
+# base64("x-access-token:<PAT>") is the standard PAT credential encoding.
+_GIT_AUTH_HEADER = (
+    "Authorization: Basic "
+    + base64.b64encode(f"x-access-token:{GITHUB_PAT}".encode()).decode()
+)
 
 genai.configure(api_key=GEMINI_KEY)
 
@@ -256,12 +265,12 @@ def sanitize_branch_name(raw: str) -> str:
 
 
 def run_git(*args, cwd=None, timeout=120):
-    """Run a git command with auth via header injection — no PAT on disk."""
+    """Run a git command with Basic-auth header injection — no PAT on disk."""
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
     git_args = [
         "git", "-c",
-        f"http.extraHeader=Authorization: Bearer {GITHUB_PAT}",
+        f"http.extraHeader={_GIT_AUTH_HEADER}",
     ] + list(args)
     try:
         return subprocess.run(
