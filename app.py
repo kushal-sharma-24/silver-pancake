@@ -31,6 +31,7 @@ GITHUB_PAT = os.environ.get("GITHUB_TOKEN")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 REPO_OWNER = "kushal-sharma-24"
 REPO_NAME = "silver-pancake"
+BASE_BRANCH = os.environ.get("BASE_BRANCH", "develop")  # override if your default branch differs
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "kushal-sharma-24")
 BOT_MENTION = "@sdlc-bot"
 BOT_COMMENT_PREFIX = "\U0001f916"  # 🤖
@@ -802,7 +803,7 @@ def _sync_generation_pipeline(job_id: str, user_goal: str):
         # --- Clone & configure ---
         repo_url = f"https://github.com/{REPO_OWNER}/{REPO_NAME}.git"
         run_git(
-            "clone", "--branch", "develop", "--depth", "1",
+            "clone", "--branch", BASE_BRANCH, "--depth", "1",
             repo_url, str(job_workspace),
         )
         run_git(
@@ -982,7 +983,7 @@ def _sync_generation_pipeline(job_id: str, user_goal: str):
             {
                 "title": delivery.pr_title,
                 "head": branch_name,
-                "base": "develop",
+                "base": BASE_BRANCH,
                 "body": pr_body,
             },
         )
@@ -1122,7 +1123,7 @@ def _sync_pr_revision(
         pr_diff = ""
         try:
             run_git(
-                "fetch", "origin", "develop", "--depth", "1",
+                "fetch", "origin", BASE_BRANCH, "--depth", "1",
                 cwd=str(job_workspace), timeout=60,
             )
             diff_result = run_git(
@@ -1141,7 +1142,7 @@ def _sync_pr_revision(
         req_schema = json.dumps(FileRequest.model_json_schema(), indent=2)
         inv_prompt = (
             f"User commented on a PR: '{comment_body}'\n"
-            f"PR diff against develop:\n{pr_diff}\n"
+            f"PR diff against {BASE_BRANCH}:\n{pr_diff}\n"
             f"Repo file tree:\n{repo_tree}\n"
             f"Which files (max {MAX_READ_FILES}) do you need to read to "
             f"address this comment? Return JSON:\n{req_schema}"
@@ -1160,7 +1161,7 @@ def _sync_pr_revision(
         deliv_schema = json.dumps(DeliveryPlan.model_json_schema(), indent=2)
         fix_prompt = (
             f"User Comment: '{comment_body}'\n"
-            f"PR diff against develop:\n{pr_diff}\n"
+            f"PR diff against {BASE_BRANCH}:\n{pr_diff}\n"
             f"Existing Files:\n{json.dumps(file_context)}\n"
             f"Fix ONLY what the user asked for. Do not revert other changes.\n"
             f"Return a DeliveryPlan JSON:\n{deliv_schema}"
