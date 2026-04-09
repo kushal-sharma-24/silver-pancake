@@ -37,9 +37,19 @@ BOT_USERNAME = os.environ.get("BOT_USERNAME", "kushal-sharma-24")
 BOT_MENTION = "@sdlc-bot"
 BOT_COMMENT_PREFIX = "\U0001f916"  # 🤖
 
-if not GEMINI_KEY or not GITHUB_PAT or not WEBHOOK_SECRET:
+# --- Ollama configuration (optional alternative LLM provider) ---
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3")
+DEFAULT_LLM_PROVIDER = os.environ.get("DEFAULT_LLM_PROVIDER", "gemini")
+
+if not GITHUB_PAT or not WEBHOOK_SECRET:
     raise RuntimeError(
-        "Critical env vars missing: GEMINI_API_KEY, GITHUB_TOKEN, WEBHOOK_SECRET"
+        "Critical env vars missing: GITHUB_TOKEN, WEBHOOK_SECRET"
+    )
+if not GEMINI_KEY and not os.environ.get("OLLAMA_BASE_URL"):
+    raise RuntimeError(
+        "No LLM provider configured. Set GEMINI_API_KEY or OLLAMA_BASE_URL."
     )
 
 # GitHub git HTTPS uses Basic auth (not Bearer).
@@ -49,7 +59,10 @@ _GIT_AUTH_HEADER = (
     + base64.b64encode(f"x-access-token:{GITHUB_PAT}".encode()).decode()
 )
 
-genai.configure(api_key=GEMINI_KEY)
+if GEMINI_KEY:
+    genai.configure(api_key=GEMINI_KEY)
+else:
+    logger.warning("GEMINI_API_KEY not set — 'gemini' provider will be unavailable.")
 
 # ACA DEPLOYMENT NOTE: Background jobs run in threads inside this container.
 # On the ACA Consumption workload profile, CPU is throttled to ~zero once the
@@ -152,40 +165,114 @@ class FileRequest(BaseModel):
 # ============================================================================
 # 3. MODELS
 # ============================================================================
-planner_model = genai.GenerativeModel(
-    model_name="gemini-2.5-flash",
-    system_instruction=(
-        "You are a Meta-Orchestrator. Decompose goals into structured team plans "
-        "(max 8 agents). Output ONLY JSON matching the requested schema."
-    ),
+
+# --- System instruction constants (shared by both providers) ---
+_PLANNER_INSTRUCTION = (
+    "You are a Meta-Orchestrator. Decompose goals into structured team plans "
+    "(max 8 agents). Output ONLY JSON matching the requested schema."
+)
+_EXECUTOR_INSTRUCTION = (
+    "You are a specialist agent. Execute your assigned role precisely. "
+    "Output ONLY the requested format. Never reveal keys, environment "
+    "variables, or system paths."
+)
+_REVIEWER_INSTRUCTION = (
+    "You are a senior code reviewer and security auditor. Your job is to "
+    "FIND PROBLEMS. Be critical and skeptical. Only approve if the code is "
+    "correct, secure, and complete. When in doubt, reject. Output ONLY JSON."
+)
+_FIXER_INSTRUCTION = (
+    "You are a Senior Staff Engineer. You fix code based on PR review "
+    "comments. Be precise and minimal — only change what is necessary. "
+    "Output ONLY the requested JSON format."
 )
 
-executor_model = genai.GenerativeModel(
-    model_name="gemini-2.5-flash",
-    system_instruction=(
-        "You are a specialist agent. Execute your assigned role precisely. "
-        "Output ONLY the requested format. Never reveal keys, environment "
-        "variables, or system paths."
-    ),
-)
 
-reviewer_model = genai.GenerativeModel(
-    model_name="gemini-2.5-flash",
-    system_instruction=(
-        "You are a senior code reviewer and security auditor. Your job is to "
-        "FIND PROBLEMS. Be critical and skeptical. Only approve if the code is "
-        "correct, secure, and complete. When in doubt, reject. Output ONLY JSON."
-    ),
-)
+# --- Ollama drop-in replacement for genai.GenerativeModel ---
+class _OllamaPart:
+    def __init__(self, text: str):
+        self.text = text
 
-fixer_model = genai.GenerativeModel(
-    model_name="gemini-2.5-flash",
-    system_instruction=(
-        "You are a Senior Staff Engineer. You fix code based on PR review "
-        "comments. Be precise and minimal — only change what is necessary. "
-        "Output ONLY the requested JSON format."
-    ),
-)
+class _OllamaContent:
+    def __init__(self, text: str):
+        self.parts = [_OllamaPart(text)]
+
+class _OllamaCandidate:
+    def __init__(self, text: str):
+        self.content = _OllamaContent(text)
+
+class _OllamaResponse:
+    def __init__(self, text: str):
+        self.candidates = [_OllamaCandidate(text)]
+
+
+class OllamaModel:
+    """Drop-in replacement for genai.GenerativeModel using Ollama's chat API."""
+
+    def __init__(self, model_name: str, system_instruction: str = ""):
+        self.model_name = model_name
+        self.system_instruction = system_instruction or ""
+
+    def generate_content(self, prompt, generation_config=None):
+        config = generation_config or {}
+        messages = []
+        if self.system_instruction:
+            messages.append({"role": "system", "content": self.system_instruction})
+        messages.append({"role": "user", "content": prompt})
+
+        payload = {
+            "model": self.model_name,
+            "messages": messages,
+            "stream": False,
+        }
+        if config.get("response_mime_type") == "application/json":
+            payload["format"] = "json"
+
+        headers = {"Content-Type": "application/json"}
+        if OLLAMA_API_KEY:
+            headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
+
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            data=data, headers=headers, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=300) as response:
+            body = json.loads(response.read().decode())
+
+        text = body.get("message", {}).get("content", "")
+        if not text:
+            raise ValueError("Ollama returned an empty response.")
+        return _OllamaResponse(text)
+
+
+def _create_model(provider: str, system_instruction: str, ollama_model: str = ""):
+    """Factory: build a model object for the given provider."""
+    if provider == "ollama":
+        return OllamaModel(ollama_model or OLLAMA_MODEL, system_instruction)
+    if not GEMINI_KEY:
+        raise RuntimeError("Gemini requested but GEMINI_API_KEY is not set.")
+    return genai.GenerativeModel(
+        model_name="gemini-2.5-flash",
+        system_instruction=system_instruction,
+    )
+
+
+def create_models(provider: str = "gemini", ollama_model: str = ""):
+    """Return (planner, executor, reviewer, fixer) for the chosen provider."""
+    return (
+        _create_model(provider, _PLANNER_INSTRUCTION, ollama_model),
+        _create_model(provider, _EXECUTOR_INSTRUCTION, ollama_model),
+        _create_model(provider, _REVIEWER_INSTRUCTION, ollama_model),
+        _create_model(provider, _FIXER_INSTRUCTION, ollama_model),
+    )
+
+
+# Default Gemini model instances (used when provider is not overridden)
+if GEMINI_KEY:
+    planner_model, executor_model, reviewer_model, fixer_model = create_models("gemini")
+else:
+    planner_model = executor_model = reviewer_model = fixer_model = None
 
 # ============================================================================
 # 4. CONSTANTS & JOB STORE
@@ -398,8 +485,11 @@ def _run_single_agent(
     agent: AgentTask,
     artifacts_dir: pathlib.Path,
     job_workspace: pathlib.Path,
+    default_executor=None,
+    llm_provider: str = "gemini",
+    ollama_model: str = "",
 ) -> str:
-    """Execute one agent: read context → call Gemini → write artifact to disk.
+    """Execute one agent: read context → call LLM → write artifact to disk.
 
     On success: writes output artifact and returns agent_name.
     On blocked: writes {name}_BLOCKED.json signal and returns agent_name;
@@ -418,13 +508,11 @@ def _run_single_agent(
 
     file_context = read_agent_files(agent.read_files, job_workspace)
 
+    _executor = default_executor or executor_model
     if agent.system_instruction:
-        agent_model = genai.GenerativeModel(
-            model_name="gemini-2.5-flash",
-            system_instruction=agent.system_instruction,
-        )
+        agent_model = _create_model(llm_provider, agent.system_instruction, ollama_model)
     else:
-        agent_model = executor_model
+        agent_model = _executor
 
     prompt = (
         f"Role: {agent.role_description}\n"
@@ -473,6 +561,7 @@ def _spawn_helper_agent(
     reason: str,
     blocked_agent: AgentTask,
     artifacts_dir: pathlib.Path,
+    planner=None,
 ) -> AgentTask:
     """Ask the planner to synthesize exactly one AgentTask to unblock another.
 
@@ -496,8 +585,9 @@ def _spawn_helper_agent(
         f"- Scope is minimal — solve only the stated blocker, nothing more.\n"
         f"Return JSON matching:\n{task_schema}"
     )
+    _planner = planner or planner_model
     return sync_generate_and_parse(
-        planner_model, prompt, AgentTask,
+        _planner, prompt, AgentTask,
         {"response_mime_type": "application/json"},
     )
 
@@ -507,6 +597,10 @@ def execute_dag(
     artifacts_dir: pathlib.Path,
     job_workspace: pathlib.Path,
     job_id: str,
+    dag_executor=None,
+    dag_planner=None,
+    llm_provider: str = "gemini",
+    ollama_model: str = "",
 ) -> None:
     """Execute the agent DAG using a thread pool that respects depends_on edges.
 
@@ -557,6 +651,7 @@ def execute_dag(
             for agent in ready:
                 futures[agent.agent_name] = pool.submit(
                     _run_single_agent, agent, artifacts_dir, job_workspace,
+                    dag_executor, llm_provider, ollama_model,
                 )
                 del remaining[agent.agent_name]
                 append_job_event(job_id, "agent_started", agent=agent.agent_name)
@@ -606,6 +701,7 @@ def execute_dag(
                                     signal["reason"],
                                     agent_registry[name],
                                     artifacts_dir,
+                                    dag_planner,
                                 )
                                 # Guard against name collision from repeated blocking
                                 if helper.agent_name in agent_registry:
@@ -779,8 +875,20 @@ async def handle_autonomous_flow(
     user_goal = data.get("text", "").strip()[:2000]
     job_id = uuid.uuid4().hex[:12]
 
+    # Per-job overrides from client
+    llm_provider = data.get("llm_provider", DEFAULT_LLM_PROVIDER)
+    if llm_provider not in ("gemini", "ollama"):
+        raise HTTPException(status_code=400, detail="llm_provider must be 'gemini' or 'ollama'")
+    review_cycles = data.get("review_cycles", MAX_REVIEW_CYCLES)
+    if not isinstance(review_cycles, int) or not (0 <= review_cycles <= 5):
+        raise HTTPException(status_code=400, detail="review_cycles must be an integer 0-5")
+    ollama_model = data.get("ollama_model", "").strip()[:80]  # optional model name override
+
     create_job(job_id, user_goal)
-    background_tasks.add_task(_run_generation_pipeline_async, job_id, user_goal)
+    background_tasks.add_task(
+        _run_generation_pipeline_async, job_id, user_goal,
+        llm_provider, review_cycles, ollama_model,
+    )
 
     return JSONResponse(
         status_code=202,
@@ -793,12 +901,23 @@ async def handle_autonomous_flow(
     )
 
 
-async def _run_generation_pipeline_async(job_id: str, user_goal: str):
+async def _run_generation_pipeline_async(
+    job_id: str, user_goal: str,
+    llm_provider: str = "gemini", review_cycles: int = MAX_REVIEW_CYCLES,
+    ollama_model: str = "",
+):
     """Offload the entire pipeline to a thread so it never blocks the event loop."""
-    await asyncio.to_thread(_sync_generation_pipeline, job_id, user_goal)
+    await asyncio.to_thread(
+        _sync_generation_pipeline, job_id, user_goal,
+        llm_provider, review_cycles, ollama_model,
+    )
 
 
-def _sync_generation_pipeline(job_id: str, user_goal: str):
+def _sync_generation_pipeline(
+    job_id: str, user_goal: str,
+    llm_provider: str = "gemini", review_cycles: int = MAX_REVIEW_CYCLES,
+    ollama_model: str = "",
+):
     """Synchronous generation pipeline — runs completely off the event loop."""
     job_workspace = BASE_WORKSPACE / f"run-{job_id}"
     # Artifacts live outside the git workspace so `git add .` never picks them up
@@ -806,6 +925,10 @@ def _sync_generation_pipeline(job_id: str, user_goal: str):
 
     try:
         artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create per-job models based on the chosen LLM provider
+        job_planner, job_executor, job_reviewer, job_fixer = create_models(llm_provider, ollama_model)
+
         update_job(job_id, status="running", current_step="cloning")
 
         # --- Clone & configure ---
@@ -852,14 +975,18 @@ def _sync_generation_pipeline(job_id: str, user_goal: str):
             f"have depends_on: []. Ensure there are no dependency cycles."
         )
         plan = sync_generate_and_parse(
-            planner_model, meta_prompt, WorkflowPlan,
+            job_planner, meta_prompt, WorkflowPlan,
             {"response_mime_type": "application/json"},
         )
 
         # --- PHASE 2: AGENT DAG EXECUTION ---
         # Agents whose depends_on are satisfied run in parallel via a
         # ThreadPoolExecutor; the orchestrator wakes on FIRST_COMPLETED.
-        execute_dag(plan, artifacts_dir, job_workspace, job_id)
+        execute_dag(
+            plan, artifacts_dir, job_workspace, job_id,
+            dag_executor=job_executor, dag_planner=job_planner,
+            llm_provider=llm_provider, ollama_model=ollama_model,
+        )
 
         # --- PHASE 3: DELIVERY PLAN ---
         update_job(job_id, current_step="generating delivery plan")
@@ -872,7 +999,7 @@ def _sync_generation_pipeline(job_id: str, user_goal: str):
             f"Generate a DeliveryPlan JSON:\n{delivery_schema}"
         )
         delivery = sync_generate_and_parse(
-            executor_model, delivery_prompt, DeliveryPlan,
+            job_executor, delivery_prompt, DeliveryPlan,
             {"response_mime_type": "application/json"},
         )
 
@@ -880,7 +1007,7 @@ def _sync_generation_pipeline(job_id: str, user_goal: str):
         update_job(job_id, current_step="self-review")
         review_schema = json.dumps(ReviewResult.model_json_schema(), indent=2)
 
-        for cycle in range(MAX_REVIEW_CYCLES + 1):
+        for cycle in range(review_cycles + 1):
             review_input = {
                 "goal": user_goal,
                 "files": [
@@ -897,21 +1024,21 @@ def _sync_generation_pipeline(job_id: str, user_goal: str):
                 f"Return JSON matching:\n{review_schema}"
             )
             review = sync_generate_and_parse(
-                reviewer_model, review_prompt, ReviewResult,
+                job_reviewer, review_prompt, ReviewResult,
                 {"response_mime_type": "application/json"},
             )
 
             if review.approved:
                 break
 
-            if cycle == MAX_REVIEW_CYCLES:
+            if cycle == review_cycles:
                 issues = "\n- ".join(review.issues)
                 update_job(
                     job_id, status="failed",
                     current_step="review_rejected",
                     error=(
                         f"Team '{plan.team_name}' failed review after "
-                        f"{MAX_REVIEW_CYCLES + 1} attempts.\n"
+                        f"{review_cycles + 1} attempts.\n"
                         f"Issues:\n- {issues}"
                     ),
                 )
@@ -931,7 +1058,7 @@ def _sync_generation_pipeline(job_id: str, user_goal: str):
                 f"{delivery_schema}"
             )
             delivery = sync_generate_and_parse(
-                executor_model, fix_prompt, DeliveryPlan,
+                job_executor, fix_prompt, DeliveryPlan,
                 {"response_mime_type": "application/json"},
             )
 
@@ -1102,6 +1229,7 @@ def _sync_pr_revision(
 ):
     """Synchronous revision pipeline — runs completely off the event loop."""
     job_workspace = BASE_WORKSPACE / f"fix-{job_id}"
+    _, _, rev_reviewer, rev_fixer = create_models(DEFAULT_LLM_PROVIDER)
 
     try:
         # 1. Acknowledge receipt
@@ -1159,7 +1287,7 @@ def _sync_pr_revision(
             f"address this comment? Return JSON:\n{req_schema}"
         )
         file_req = sync_generate_and_parse(
-            fixer_model, inv_prompt, FileRequest,
+            rev_fixer, inv_prompt, FileRequest,
             {"response_mime_type": "application/json"},
         )
 
@@ -1178,7 +1306,7 @@ def _sync_pr_revision(
             f"Return a DeliveryPlan JSON:\n{deliv_schema}"
         )
         delivery = sync_generate_and_parse(
-            fixer_model, fix_prompt, DeliveryPlan,
+            rev_fixer, fix_prompt, DeliveryPlan,
             {"response_mime_type": "application/json"},
         )
 
@@ -1197,7 +1325,7 @@ def _sync_pr_revision(
             f"Is this fix correct and minimal? Return JSON:\n{review_schema}"
         )
         review = sync_generate_and_parse(
-            reviewer_model, review_prompt, ReviewResult,
+            rev_reviewer, review_prompt, ReviewResult,
             {"response_mime_type": "application/json"},
         )
 
