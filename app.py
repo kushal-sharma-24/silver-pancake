@@ -209,9 +209,10 @@ class _OllamaResponse:
 class OllamaModel:
     """Drop-in replacement for genai.GenerativeModel using Ollama's chat API."""
 
-    def __init__(self, model_name: str, system_instruction: str = ""):
+    def __init__(self, model_name: str, system_instruction: str = "", base_url: str = ""):
         self.model_name = model_name
         self.system_instruction = system_instruction or ""
+        self.base_url = (base_url or OLLAMA_BASE_URL).rstrip("/")
 
     def generate_content(self, prompt, generation_config=None):
         config = generation_config or {}
@@ -234,7 +235,7 @@ class OllamaModel:
 
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
-            f"{OLLAMA_BASE_URL}/api/chat",
+            f"{self.base_url}/api/chat",
             data=data, headers=headers, method="POST",
         )
         with urllib.request.urlopen(req, timeout=300) as response:
@@ -246,10 +247,10 @@ class OllamaModel:
         return _OllamaResponse(text)
 
 
-def _create_model(provider: str, system_instruction: str, ollama_model: str = ""):
+def _create_model(provider: str, system_instruction: str, ollama_model: str = "", ollama_base_url: str = ""):
     """Factory: build a model object for the given provider."""
     if provider == "ollama":
-        return OllamaModel(ollama_model or OLLAMA_MODEL, system_instruction)
+        return OllamaModel(ollama_model or OLLAMA_MODEL, system_instruction, ollama_base_url)
     if not GEMINI_KEY:
         raise RuntimeError("Gemini requested but GEMINI_API_KEY is not set.")
     return genai.GenerativeModel(
@@ -258,13 +259,13 @@ def _create_model(provider: str, system_instruction: str, ollama_model: str = ""
     )
 
 
-def create_models(provider: str = "gemini", ollama_model: str = ""):
+def create_models(provider: str = "gemini", ollama_model: str = "", ollama_base_url: str = ""):
     """Return (planner, executor, reviewer, fixer) for the chosen provider."""
     return (
-        _create_model(provider, _PLANNER_INSTRUCTION, ollama_model),
-        _create_model(provider, _EXECUTOR_INSTRUCTION, ollama_model),
-        _create_model(provider, _REVIEWER_INSTRUCTION, ollama_model),
-        _create_model(provider, _FIXER_INSTRUCTION, ollama_model),
+        _create_model(provider, _PLANNER_INSTRUCTION, ollama_model, ollama_base_url),
+        _create_model(provider, _EXECUTOR_INSTRUCTION, ollama_model, ollama_base_url),
+        _create_model(provider, _REVIEWER_INSTRUCTION, ollama_model, ollama_base_url),
+        _create_model(provider, _FIXER_INSTRUCTION, ollama_model, ollama_base_url),
     )
 
 
@@ -488,6 +489,7 @@ def _run_single_agent(
     default_executor=None,
     llm_provider: str = "gemini",
     ollama_model: str = "",
+    ollama_base_url: str = "",
 ) -> str:
     """Execute one agent: read context → call LLM → write artifact to disk.
 
@@ -510,7 +512,7 @@ def _run_single_agent(
 
     _executor = default_executor or executor_model
     if agent.system_instruction:
-        agent_model = _create_model(llm_provider, agent.system_instruction, ollama_model)
+        agent_model = _create_model(llm_provider, agent.system_instruction, ollama_model, ollama_base_url)
     else:
         agent_model = _executor
 
@@ -601,6 +603,7 @@ def execute_dag(
     dag_planner=None,
     llm_provider: str = "gemini",
     ollama_model: str = "",
+    ollama_base_url: str = "",
 ) -> None:
     """Execute the agent DAG using a thread pool that respects depends_on edges.
 
@@ -651,7 +654,7 @@ def execute_dag(
             for agent in ready:
                 futures[agent.agent_name] = pool.submit(
                     _run_single_agent, agent, artifacts_dir, job_workspace,
-                    dag_executor, llm_provider, ollama_model,
+                    dag_executor, llm_provider, ollama_model, ollama_base_url,
                 )
                 del remaining[agent.agent_name]
                 append_job_event(job_id, "agent_started", agent=agent.agent_name)
@@ -882,12 +885,13 @@ async def handle_autonomous_flow(
     review_cycles = data.get("review_cycles", MAX_REVIEW_CYCLES)
     if not isinstance(review_cycles, int) or not (0 <= review_cycles <= 5):
         raise HTTPException(status_code=400, detail="review_cycles must be an integer 0-5")
-    ollama_model = data.get("ollama_model", "").strip()[:80]  # optional model name override
+    ollama_model    = data.get("ollama_model", "").strip()[:80]
+    ollama_base_url = data.get("ollama_base_url", "").strip()[:200]
 
     create_job(job_id, user_goal)
     background_tasks.add_task(
         _run_generation_pipeline_async, job_id, user_goal,
-        llm_provider, review_cycles, ollama_model,
+        llm_provider, review_cycles, ollama_model, ollama_base_url,
     )
 
     return JSONResponse(
@@ -904,19 +908,19 @@ async def handle_autonomous_flow(
 async def _run_generation_pipeline_async(
     job_id: str, user_goal: str,
     llm_provider: str = "gemini", review_cycles: int = MAX_REVIEW_CYCLES,
-    ollama_model: str = "",
+    ollama_model: str = "", ollama_base_url: str = "",
 ):
     """Offload the entire pipeline to a thread so it never blocks the event loop."""
     await asyncio.to_thread(
         _sync_generation_pipeline, job_id, user_goal,
-        llm_provider, review_cycles, ollama_model,
+        llm_provider, review_cycles, ollama_model, ollama_base_url,
     )
 
 
 def _sync_generation_pipeline(
     job_id: str, user_goal: str,
     llm_provider: str = "gemini", review_cycles: int = MAX_REVIEW_CYCLES,
-    ollama_model: str = "",
+    ollama_model: str = "", ollama_base_url: str = "",
 ):
     """Synchronous generation pipeline — runs completely off the event loop."""
     job_workspace = BASE_WORKSPACE / f"run-{job_id}"
@@ -927,7 +931,7 @@ def _sync_generation_pipeline(
         artifacts_dir.mkdir(parents=True, exist_ok=True)
 
         # Create per-job models based on the chosen LLM provider
-        job_planner, job_executor, job_reviewer, job_fixer = create_models(llm_provider, ollama_model)
+        job_planner, job_executor, job_reviewer, job_fixer = create_models(llm_provider, ollama_model, ollama_base_url)
 
         update_job(job_id, status="running", current_step="cloning")
 
@@ -986,6 +990,7 @@ def _sync_generation_pipeline(
             plan, artifacts_dir, job_workspace, job_id,
             dag_executor=job_executor, dag_planner=job_planner,
             llm_provider=llm_provider, ollama_model=ollama_model,
+            ollama_base_url=ollama_base_url,
         )
 
         # --- PHASE 3: DELIVERY PLAN ---
