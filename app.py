@@ -221,6 +221,11 @@ class OllamaModel:
         self.model_name = model_name
         self.system_instruction = system_instruction or ""
         self.base_url = (base_url or OLLAMA_BASE_URL).rstrip("/")
+        # Accept either a root URL or a full endpoint URL from callers/env.
+        for suffix in ("/v1/chat/completions", "/api/chat"):
+            if self.base_url.endswith(suffix):
+                self.base_url = self.base_url[: -len(suffix)]
+                break
         # Use OpenAI-compat endpoint when model name contains "/" (e.g. Qwen/Qwen3.5-9B)
         # or when the base URL is not a plain localhost Ollama instance
         self._openai_compat = (
@@ -251,12 +256,17 @@ class OllamaModel:
                 payload["response_format"] = {"type": "json_object"}
 
             data = json.dumps(payload).encode("utf-8")
+            target_url = f"{self.base_url}/v1/chat/completions"
             req = urllib.request.Request(
-                f"{self.base_url}/v1/chat/completions",
+                target_url,
                 data=data, headers=headers, method="POST",
             )
-            with urllib.request.urlopen(req, timeout=300) as response:
-                body = json.loads(response.read().decode())
+            try:
+                with urllib.request.urlopen(req, timeout=300) as response:
+                    body = json.loads(response.read().decode())
+            except urllib.error.HTTPError as e:
+                err_body = e.read().decode(errors="replace")[:400]
+                raise RuntimeError(f"LLM HTTP {e.code} at {target_url}: {err_body}") from e
 
             text = body.get("choices", [{}])[0].get("message", {}).get("content", "")
         else:
@@ -270,12 +280,17 @@ class OllamaModel:
                 payload["format"] = "json"
 
             data = json.dumps(payload).encode("utf-8")
+            target_url = f"{self.base_url}/api/chat"
             req = urllib.request.Request(
-                f"{self.base_url}/api/chat",
+                target_url,
                 data=data, headers=headers, method="POST",
             )
-            with urllib.request.urlopen(req, timeout=300) as response:
-                body = json.loads(response.read().decode())
+            try:
+                with urllib.request.urlopen(req, timeout=300) as response:
+                    body = json.loads(response.read().decode())
+            except urllib.error.HTTPError as e:
+                err_body = e.read().decode(errors="replace")[:400]
+                raise RuntimeError(f"LLM HTTP {e.code} at {target_url}: {err_body}") from e
 
             text = body.get("message", {}).get("content", "")
 
