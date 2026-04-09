@@ -207,12 +207,27 @@ class _OllamaResponse:
 
 
 class OllamaModel:
-    """Drop-in replacement for genai.GenerativeModel using Ollama's chat API."""
+    """Drop-in replacement for genai.GenerativeModel.
+
+    Supports both:
+    - Native Ollama servers  (/api/chat)
+    - OpenAI-compatible servers like vLLM, LM Studio (/v1/chat/completions)
+
+    Detection: if OLLAMA_BASE_URL contains a path segment or the model name
+    contains a "/" (HuggingFace-style), we assume OpenAI-compatible.
+    """
 
     def __init__(self, model_name: str, system_instruction: str = "", base_url: str = ""):
         self.model_name = model_name
         self.system_instruction = system_instruction or ""
         self.base_url = (base_url or OLLAMA_BASE_URL).rstrip("/")
+        # Use OpenAI-compat endpoint when model name contains "/" (e.g. Qwen/Qwen3.5-9B)
+        # or when the base URL is not a plain localhost Ollama instance
+        self._openai_compat = (
+            "/" in model_name
+            or "localhost:11434" not in self.base_url
+            and "127.0.0.1:11434" not in self.base_url
+        )
 
     def generate_content(self, prompt, generation_config=None):
         config = generation_config or {}
@@ -221,29 +236,51 @@ class OllamaModel:
             messages.append({"role": "system", "content": self.system_instruction})
         messages.append({"role": "user", "content": prompt})
 
-        payload = {
-            "model": self.model_name,
-            "messages": messages,
-            "stream": False,
-        }
-        if config.get("response_mime_type") == "application/json":
-            payload["format"] = "json"
-
         headers = {"Content-Type": "application/json"}
         if OLLAMA_API_KEY:
             headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
 
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            f"{self.base_url}/api/chat",
-            data=data, headers=headers, method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=300) as response:
-            body = json.loads(response.read().decode())
+        if self._openai_compat:
+            # OpenAI-compatible path (vLLM, LM Studio, ngrok-proxied servers)
+            payload = {
+                "model": self.model_name,
+                "messages": messages,
+                "stream": False,
+            }
+            if config.get("response_mime_type") == "application/json":
+                payload["response_format"] = {"type": "json_object"}
 
-        text = body.get("message", {}).get("content", "")
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                f"{self.base_url}/v1/chat/completions",
+                data=data, headers=headers, method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=300) as response:
+                body = json.loads(response.read().decode())
+
+            text = body.get("choices", [{}])[0].get("message", {}).get("content", "")
+        else:
+            # Native Ollama path
+            payload = {
+                "model": self.model_name,
+                "messages": messages,
+                "stream": False,
+            }
+            if config.get("response_mime_type") == "application/json":
+                payload["format"] = "json"
+
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                f"{self.base_url}/api/chat",
+                data=data, headers=headers, method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=300) as response:
+                body = json.loads(response.read().decode())
+
+            text = body.get("message", {}).get("content", "")
+
         if not text:
-            raise ValueError("Ollama returned an empty response.")
+            raise ValueError("LLM returned an empty response.")
         return _OllamaResponse(text)
 
 
