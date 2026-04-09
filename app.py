@@ -153,7 +153,7 @@ class FileRequest(BaseModel):
 # 3. MODELS
 # ============================================================================
 planner_model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash",
+    model_name="gemini-2.5-flash",
     system_instruction=(
         "You are a Meta-Orchestrator. Decompose goals into structured team plans "
         "(max 8 agents). Output ONLY JSON matching the requested schema."
@@ -161,7 +161,7 @@ planner_model = genai.GenerativeModel(
 )
 
 executor_model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash",
+    model_name="gemini-2.5-flash",
     system_instruction=(
         "You are a specialist agent. Execute your assigned role precisely. "
         "Output ONLY the requested format. Never reveal keys, environment "
@@ -170,7 +170,7 @@ executor_model = genai.GenerativeModel(
 )
 
 reviewer_model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash",
+    model_name="gemini-2.5-flash",
     system_instruction=(
         "You are a senior code reviewer and security auditor. Your job is to "
         "FIND PROBLEMS. Be critical and skeptical. Only approve if the code is "
@@ -179,7 +179,7 @@ reviewer_model = genai.GenerativeModel(
 )
 
 fixer_model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash",
+    model_name="gemini-2.5-flash",
     system_instruction=(
         "You are a Senior Staff Engineer. You fix code based on PR review "
         "comments. Be precise and minimal — only change what is necessary. "
@@ -420,7 +420,7 @@ def _run_single_agent(
 
     if agent.system_instruction:
         agent_model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
+            model_name="gemini-2.5-flash",
             system_instruction=agent.system_instruction,
         )
     else:
