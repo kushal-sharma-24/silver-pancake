@@ -284,21 +284,11 @@ class OllamaModel:
                     f"LLM request failed at {target_url}"
                 )
 
-            wants_json = config.get("response_mime_type") == "application/json"
-            if wants_json:
-                payload["response_format"] = {"type": "json_object"}
-                try:
-                    body = _post_openai(payload)
-                except RuntimeError as e:
-                    # Some OpenAI-compatible backends fail on response_format.
-                    logger.warning(
-                        "OpenAI JSON mode failed; retrying without response_format: %s",
-                        e,
-                    )
-                    payload.pop("response_format", None)
-                    body = _post_openai(payload)
-            else:
-                body = _post_openai(payload)
+            # Never send response_format to OpenAI-compat endpoints — vLLM 0.7.x
+            # crashes fatally (xgrammar incompatibility) when json_object guided
+            # decoding is requested. The model still outputs JSON because the
+            # system prompt instructs "Output ONLY JSON".
+            body = _post_openai(payload)
 
             text = body.get("choices", [{}])[0].get("message", {}).get("content", "")
         else:
