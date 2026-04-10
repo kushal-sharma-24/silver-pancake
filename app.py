@@ -258,15 +258,15 @@ class OllamaModel:
             target_url = f"{self.base_url}/v1/chat/completions"
 
             def _post_openai(payload_obj):
-                data = json.dumps(payload_obj).encode("utf-8")
-                req = urllib.request.Request(
-                    target_url,
-                    data=data,
-                    headers=headers,
-                    method="POST",
-                )
                 last_error = None
-                for attempt in range(3):
+                for attempt in range(4):
+                    data = json.dumps(payload_obj).encode("utf-8")
+                    req = urllib.request.Request(
+                        target_url,
+                        data=data,
+                        headers=headers,
+                        method="POST",
+                    )
                     try:
                         with urllib.request.urlopen(req, timeout=300) as response:
                             return json.loads(response.read().decode())
@@ -275,6 +275,18 @@ class OllamaModel:
                         last_error = RuntimeError(
                             f"LLM HTTP {e.code} at {target_url}: {err_body}"
                         )
+                        # Context-length overflow: halve max_tokens and retry
+                        if e.code == 400 and "context length" in err_body.lower():
+                            cur = payload_obj.get("max_tokens", 2048)
+                            reduced = max(cur // 2, 128)
+                            if reduced < cur:
+                                logger.warning(
+                                    f"Context overflow (max_tokens={cur}), "
+                                    f"retrying with max_tokens={reduced}"
+                                )
+                                payload_obj["max_tokens"] = reduced
+                                continue
+                            raise last_error from e
                         # Retry transient upstream issues.
                         if e.code in (500, 502, 503, 504) and attempt < 2:
                             time.sleep(1 + attempt)
@@ -816,6 +828,10 @@ def execute_dag(
                                     f"for '{name}': {spawn_err} — marking failed."
                                 )
                                 failed.add(name)
+                                append_job_event(
+                                    job_id, "agent_failed", agent=name,
+                                    error=f"Helper spawn failed: {spawn_err}",
+                                )
                         else:
                             logger.warning(
                                 f"Job {job_id}: '{name}' blocked but "
@@ -823,6 +839,10 @@ def execute_dag(
                                 f"reached — marking failed."
                             )
                             failed.add(name)
+                            append_job_event(
+                                job_id, "agent_failed", agent=name,
+                                error="Blocked and max dynamic agents reached",
+                            )
                     else:
                         completed.add(name)
                         append_job_event(
@@ -838,6 +858,8 @@ def execute_dag(
                     append_job_event(job_id, "agent_failed", agent=name, error=str(e))
                     logger.error(f"Job {job_id}: '{name}' ✗ — {e}")
                 del futures[name]
+
+    return len(completed), len(failed), len(agent_registry)
 
 
 # ============================================================================
@@ -862,16 +884,42 @@ def sync_generate_with_retry(model, prompt, config=None, max_retries=2):
 
 
 def sync_generate_and_parse(model, prompt, schema_class, config=None, max_retries=2):
-    """Synchronous generate + parse + validate with retry."""
+    """Synchronous generate + parse + validate with retry.
+
+    Detects when a small model echoes back the JSON Schema definition
+    instead of filling in values, and adds a corrective hint on retry.
+    """
+    effective_prompt = prompt
     for attempt in range(max_retries + 1):
         try:
-            text = sync_generate_with_retry(model, prompt, config, max_retries=0)
-            return schema_class(**json.loads(text))
+            text = sync_generate_with_retry(model, effective_prompt, config, max_retries=0)
+            # Strip markdown fences that small models occasionally emit
+            text = re.sub(r"^\s*```(?:json)?\s*\n?", "", text, flags=re.IGNORECASE)
+            text = re.sub(r"\n?\s*```\s*$", "", text).strip()
+            parsed = json.loads(text)
+            # Detect schema echo: model returned the JSON Schema definition
+            # (has "properties" + "type":"object") instead of actual values
+            if (isinstance(parsed, dict)
+                    and "properties" in parsed
+                    and parsed.get("type") == "object"):
+                raise ValueError(
+                    "Model returned the JSON schema definition instead of "
+                    "filling in actual values."
+                )
+            return schema_class(**parsed)
         except (json.JSONDecodeError, ValidationError, ValueError) as e:
             if attempt == max_retries:
                 raise
             logger.warning(
                 f"Parse/validation failed (attempt {attempt + 1}): {e}"
+            )
+            # Add corrective hint so the model stops echoing the schema
+            effective_prompt = (
+                prompt
+                + "\n\nIMPORTANT: Return a JSON object with actual values "
+                  "filled in. Do NOT return the schema definition itself. "
+                  "For example, if the schema says '\"approved\": bool', "
+                  "return '\"approved\": true' — not '\"approved\": {\"type\": \"boolean\"}'."
             )
             time.sleep(2 ** attempt)
 
@@ -1060,12 +1108,24 @@ def _sync_generation_pipeline(
         # --- PHASE 2: AGENT DAG EXECUTION ---
         # Agents whose depends_on are satisfied run in parallel via a
         # ThreadPoolExecutor; the orchestrator wakes on FIRST_COMPLETED.
-        execute_dag(
+        dag_ok, dag_fail, dag_total = execute_dag(
             plan, artifacts_dir, job_workspace, job_id,
             dag_executor=job_executor, dag_planner=job_planner,
             llm_provider=llm_provider, ollama_model=ollama_model,
             ollama_base_url=ollama_base_url,
         )
+
+        # Circuit breaker: abort if less than half the agents succeeded
+        if dag_total > 0 and dag_ok < dag_total * 0.5:
+            update_job(
+                job_id, status="failed", current_step="dag_incomplete",
+                error=(
+                    f"DAG too degraded: only {dag_ok}/{dag_total} agents "
+                    f"completed ({dag_fail} failed). Aborting — not enough "
+                    f"context to produce a meaningful delivery."
+                ),
+            )
+            return
 
         # --- PHASE 3: DELIVERY PLAN ---
         update_job(job_id, current_step="generating delivery plan")
