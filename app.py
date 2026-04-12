@@ -1153,7 +1153,15 @@ def _sync_generation_pipeline(
             f"- Set depends_on to list agent names that must complete before "
             f"this agent starts. Agents with empty depends_on (or only already "
             f"resolved deps) will run in parallel. The very first agent must "
-            f"have depends_on: []. Ensure there are no dependency cycles."
+            f"have depends_on: []. Ensure there are no dependency cycles.\n"
+            f"CRITICAL CONSTRAINTS:\n"
+            f"- The final deliverable is a set of self-contained FILES committed to a git repo.\n"
+            f"- ALL code must live inside the delivered files \u2014 do NOT plan for external "
+            f"packages, modules, or APIs that don't already exist in the repo or on PyPI.\n"
+            f"- If the goal requires a bot/AI/algorithm, the implementation MUST be "
+            f"inline in the delivered source files, not in a separate undelivered module.\n"
+            f"- Each agent's output is a TEXT ARTIFACT. The final 'delivery plan' agent "
+            f"will synthesize all artifacts into actual source files \u2014 plan accordingly."
         )
         plan = sync_generate_and_parse(
             job_planner, meta_prompt, WorkflowPlan,
@@ -1190,7 +1198,19 @@ def _sync_generation_pipeline(
         artifact_context = read_artifact_context(all_keys, artifacts_dir, max_budget=16000)
         delivery_schema = json.dumps(DeliveryPlan.model_json_schema(), indent=2)
         delivery_prompt = (
-            f"Based on these artifacts:\n{json.dumps(artifact_context)}\n"
+            f"TASK: Synthesize all agent artifacts into production-ready, self-contained files.\n\n"
+            f"Artifacts from agents:\n{json.dumps(artifact_context)}\n\n"
+            f"RULES:\n"
+            f"- Merge ALL code from the artifacts into complete, runnable source files.\n"
+            f"- Every file must be self-contained: all imports must resolve to the standard "
+            f"library, a pip package from requirements.txt, or another file in this delivery.\n"
+            f"- Do NOT reference external modules, packages, or repos that are not delivered "
+            f"or available on PyPI.\n"
+            f"- If multiple artifacts describe the same functionality (e.g. a bot algorithm), "
+            f"merge them into a single coherent implementation inside the main file or a "
+            f"co-delivered module.\n"
+            f"- Include a requirements.txt ONLY with real pip-installable packages.\n"
+            f"- Include complete, actually runnable code \u2014 not stubs or pseudocode.\n\n"
             f"Generate a DeliveryPlan JSON:\n{delivery_schema}"
         )
         delivery = sync_generate_and_parse(
@@ -1215,7 +1235,14 @@ def _sync_generation_pipeline(
                 f"Review these FILES to be committed against the goal "
                 f"'{user_goal}':\n"
                 f"{json.dumps(review_input, indent=2)}\n"
-                f"Check for correctness, security, and edge cases.\n"
+                f"Check for CONCRETE, FIXABLE issues only:\n"
+                f"- Does the code actually run? Are there syntax errors or missing imports?\n"
+                f"- Does it meet the stated goal?\n"
+                f"- Are there real security vulnerabilities (SQL injection, path traversal, etc.)?\n"
+                f"- Do NOT reject for vague/theoretical concerns like 'potential security risk'.\n"
+                f"- Do NOT reject for missing features the user didn't ask for.\n"
+                f"- Do NOT reject because a module is implemented inline instead of as a package.\n"
+                f"- Each issue in your list must describe a SPECIFIC problem and HOW to fix it.\n"
                 f"Return JSON matching:\n{review_schema}"
             )
             review = sync_generate_and_parse(
@@ -1245,11 +1272,18 @@ def _sync_generation_pipeline(
                 for f in delivery.files
             ]
             fix_prompt = (
-                f"The Reviewer rejected the DeliveryPlan with these issues:\n"
-                f"{json.dumps(review.issues)}\n"
-                f"Rejected files:\n{json.dumps(rejected_files)}\n"
-                f"Fix ALL issues and regenerate the DeliveryPlan JSON:\n"
-                f"{delivery_schema}"
+                f"A code reviewer REJECTED the delivery with these issues:\n"
+                f"{json.dumps(review.issues)}\n\n"
+                f"Current files (fix these):\n{json.dumps(rejected_files)}\n\n"
+                f"RULES FOR FIXING:\n"
+                f"- Fix EVERY issue listed above.\n"
+                f"- Keep all code SELF-CONTAINED \u2014 all imports must resolve to stdlib, "
+                f"pip packages, or other files in this delivery.\n"
+                f"- If a missing module is referenced, implement it INLINE in the relevant file "
+                f"or as a co-delivered .py file.\n"
+                f"- Output COMPLETE file contents, not patches or diffs.\n"
+                f"- Do NOT introduce new external dependencies that don't exist on PyPI.\n\n"
+                f"Regenerate the full DeliveryPlan JSON:\n{delivery_schema}"
             )
             delivery = sync_generate_and_parse(
                 job_executor, fix_prompt, DeliveryPlan,
