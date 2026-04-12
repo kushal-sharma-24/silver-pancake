@@ -943,9 +943,15 @@ def sync_generate_and_parse(model, prompt, schema_class, config=None, max_retrie
             text = re.sub(r"\n?\s*```\s*$", "", text).strip()
             # Use raw_decode to parse only the first JSON value,
             # ignoring trailing text / duplicate objects the LLM may emit.
-            decoder = json.JSONDecoder()
+            # If that fails, attempt lightweight JSON repair before giving up.
             idx = text.index("{") if "{" in text else 0
-            parsed, _ = decoder.raw_decode(text, idx)
+            try:
+                parsed, _ = json.JSONDecoder().raw_decode(text, idx)
+            except json.JSONDecodeError:
+                repaired = re.sub(r',\s*([}\]])', r'\1', text)  # trailing commas
+                repaired = repaired.replace('\r\n', '\\n').replace('\r', '\\n')
+                r_idx = repaired.index("{") if "{" in repaired else 0
+                parsed, _ = json.JSONDecoder().raw_decode(repaired, r_idx)
             # Detect schema echo: model returned the JSON Schema definition
             # (has "properties" + "type":"object") instead of actual values
             if (isinstance(parsed, dict)
@@ -967,6 +973,9 @@ def sync_generate_and_parse(model, prompt, schema_class, config=None, max_retrie
                 isinstance(e, json.JSONDecodeError)
                 and "unterminated" in str(e).lower()
             )
+            is_malformed_json = (
+                isinstance(e, json.JSONDecodeError) and not is_truncation
+            )
             if is_truncation:
                 effective_prompt = (
                     prompt
@@ -975,6 +984,19 @@ def sync_generate_and_parse(model, prompt, schema_class, config=None, max_retrie
                       "SHORTER, complete JSON response this time. Minimize "
                       "file content — use only essential code, no comments or "
                       "docstrings. Ensure the JSON is properly closed."
+                )
+            elif is_malformed_json:
+                effective_prompt = (
+                    prompt
+                    + "\n\nCRITICAL: Your previous JSON response had a syntax error: "
+                      f"{e}\n"
+                      "Common causes:\n"
+                      '- Unescaped double quotes inside string values (use \\" instead of ")\n'
+                      "- Unescaped backslashes (use \\\\ instead of \\)\n"
+                      "- Literal newlines inside strings (use \\n instead)\n"
+                      "- Trailing commas after the last element in arrays/objects\n"
+                      "Ensure ALL string values containing code have properly escaped "
+                      "special characters. Output ONLY valid JSON."
                 )
             else:
                 # Add corrective hint so the model stops echoing the schema
