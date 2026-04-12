@@ -941,7 +941,11 @@ def sync_generate_and_parse(model, prompt, schema_class, config=None, max_retrie
             # Strip markdown fences that small models occasionally emit
             text = re.sub(r"^\s*```(?:json)?\s*\n?", "", text, flags=re.IGNORECASE)
             text = re.sub(r"\n?\s*```\s*$", "", text).strip()
-            parsed = json.loads(text)
+            # Use raw_decode to parse only the first JSON value,
+            # ignoring trailing text / duplicate objects the LLM may emit.
+            decoder = json.JSONDecoder()
+            idx = text.index("{") if "{" in text else 0
+            parsed, _ = decoder.raw_decode(text, idx)
             # Detect schema echo: model returned the JSON Schema definition
             # (has "properties" + "type":"object") instead of actual values
             if (isinstance(parsed, dict)
