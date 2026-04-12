@@ -247,7 +247,7 @@ class OllamaModel:
 
         if self._openai_compat:
             # OpenAI-compatible path (vLLM, LM Studio, ngrok-proxied servers)
-            max_tok = min(int(config.get("max_output_tokens", 4096)), 4090)
+            max_tok = min(int(config.get("max_output_tokens", 4096)), 4096)
             payload = {
                 "model": self.model_name,
                 "messages": messages,
@@ -275,7 +275,8 @@ class OllamaModel:
                         last_error = RuntimeError(
                             f"LLM HTTP {e.code} at {target_url}: {err_body}"
                         )
-                        # Context-length overflow: halve max_tokens and retry
+                        # Context-length overflow: halve max_tokens and retry;
+                        # if that's already minimal, truncate the prompt itself.
                         if e.code == 400 and "context length" in err_body.lower():
                             cur = payload_obj.get("max_tokens", 4096)
                             reduced = max(cur // 2, 128)
@@ -285,6 +286,21 @@ class OllamaModel:
                                     f"retrying with max_tokens={reduced}"
                                 )
                                 payload_obj["max_tokens"] = reduced
+                                continue
+                            # max_tokens already minimized — truncate prompt
+                            truncated = False
+                            for msg in payload_obj.get("messages", []):
+                                if msg["role"] == "user" and len(msg["content"]) > 2000:
+                                    orig_len = len(msg["content"])
+                                    msg["content"] = msg["content"][:orig_len // 2]
+                                    logger.warning(
+                                        f"Truncating user prompt from {orig_len} "
+                                        f"to {len(msg['content'])} chars"
+                                    )
+                                    payload_obj["max_tokens"] = max(cur, 512)
+                                    truncated = True
+                                    break
+                            if truncated:
                                 continue
                             raise last_error from e
                         # Retry transient upstream issues.
@@ -372,6 +388,7 @@ MAX_READ_FILES = 10
 READ_BUDGET = 30000
 MAX_REVIEW_CYCLES = 2
 MAX_DYNAMIC_AGENTS = 3  # max helper agents that can be spawned per job
+MAX_BLOCKS_PER_AGENT = 2  # max times a single agent can block before being marked failed
 KEY_FILES = [
     "README.md", "requirements.txt", "setup.py", "pyproject.toml",
     "package.json", "tsconfig.json",
@@ -542,22 +559,24 @@ def read_agent_files(
 
 def read_artifact_context(
     keys: List[str], artifacts_dir: pathlib.Path,
+    max_budget: int = 0,
 ) -> Dict[str, str]:
     """Read agent outputs from the file-based artifact store.
 
     Each file is capped at ARTIFACT_CHAR_LIMIT independently so no output
     is ever sliced mid-token (e.g. inside a class definition).
-    A total READ_BUDGET cap prevents prompt explosion.
+    A total budget cap prevents prompt explosion.
     """
+    budget_limit = max_budget if max_budget > 0 else READ_BUDGET
     context: Dict[str, str] = {}
     total = 0
     for key in keys:
-        if total >= READ_BUDGET:
+        if total >= budget_limit:
             break
         fp = artifacts_dir / f"{key}.txt"
         if fp.exists():
             chunk = fp.read_text(errors="replace")[
-                : min(ARTIFACT_CHAR_LIMIT, READ_BUDGET - total)
+                : min(ARTIFACT_CHAR_LIMIT, budget_limit - total)
             ]
             context[key] = chunk
             total += len(chunk)
@@ -709,6 +728,7 @@ def execute_dag(
     # Single source of truth for AgentTask objects; grows when helpers are injected.
     agent_registry: Dict[str, AgentTask] = dict(remaining)
     dynamic_agent_count = 0
+    block_counts: Dict[str, int] = {}  # per-agent block counter
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         while remaining or futures:
@@ -783,7 +803,21 @@ def execute_dag(
                         signal = json.loads(blocked_file.read_text())
                         blocked_file.unlink()  # consume signal; fresh file on re-block
 
-                        if dynamic_agent_count < MAX_DYNAMIC_AGENTS:
+                        block_counts[name] = block_counts.get(name, 0) + 1
+                        if block_counts[name] > MAX_BLOCKS_PER_AGENT:
+                            logger.warning(
+                                f"Job {job_id}: '{name}' blocked "
+                                f"{block_counts[name]} times — giving up."
+                            )
+                            failed.add(name)
+                            append_job_event(
+                                job_id, "agent_failed", agent=name,
+                                error=(
+                                    f"Blocked {block_counts[name]} times, "
+                                    f"exceeded MAX_BLOCKS_PER_AGENT"
+                                ),
+                            )
+                        elif dynamic_agent_count < MAX_DYNAMIC_AGENTS:
                             dynamic_agent_count += 1
                             try:
                                 helper = _spawn_helper_agent(
@@ -1129,9 +1163,10 @@ def _sync_generation_pipeline(
 
         # --- PHASE 3: DELIVERY PLAN ---
         update_job(job_id, current_step="generating delivery plan")
-        # Read all agent outputs from disk — READ_BUDGET shared across all files
+        # Read all agent outputs — use a tighter budget to fit small context windows.
+        # 16 000 chars ≈ 4 000 tokens; leaves room for schema + completion in 8 K models.
         all_keys = [p.stem for p in artifacts_dir.glob("*.txt")]
-        artifact_context = read_artifact_context(all_keys, artifacts_dir)
+        artifact_context = read_artifact_context(all_keys, artifacts_dir, max_budget=16000)
         delivery_schema = json.dumps(DeliveryPlan.model_json_schema(), indent=2)
         delivery_prompt = (
             f"Based on these artifacts:\n{json.dumps(artifact_context)}\n"
