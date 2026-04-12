@@ -177,9 +177,12 @@ _EXECUTOR_INSTRUCTION = (
     "variables, or system paths."
 )
 _REVIEWER_INSTRUCTION = (
-    "You are a senior code reviewer and security auditor. Your job is to "
-    "FIND PROBLEMS. Be critical and skeptical. Only approve if the code is "
-    "correct, secure, and complete. When in doubt, reject. Output ONLY JSON."
+    "You are a senior code reviewer. Verify that code is correct, secure, "
+    "and meets the stated goal. Focus on CONCRETE issues: syntax errors, "
+    "missing imports, broken logic, real security vulnerabilities. "
+    "Do NOT reject for style preferences, theoretical concerns, or missing "
+    "features not requested by the user. Approve if the code works correctly "
+    "for its intended purpose. Output ONLY JSON."
 )
 _FIXER_INSTRUCTION = (
     "You are a Senior Staff Engineer. You fix code based on PR review "
@@ -230,8 +233,10 @@ class OllamaModel:
         # or when the base URL is not a plain localhost Ollama instance
         self._openai_compat = (
             "/" in model_name
-            or "localhost:11434" not in self.base_url
-            and "127.0.0.1:11434" not in self.base_url
+            or (
+                "localhost:11434" not in self.base_url
+                and "127.0.0.1:11434" not in self.base_url
+            )
         )
 
     def generate_content(self, prompt, generation_config=None):
@@ -393,7 +398,7 @@ ARTIFACT_CHAR_LIMIT = 12000
 MAX_READ_FILES = 10
 READ_BUDGET = 30000
 MAX_REVIEW_CYCLES = 2
-MAX_DYNAMIC_AGENTS = 3  # max helper agents that can be spawned per job
+MAX_DYNAMIC_AGENTS = 6  # max helper agents that can be spawned per job
 MAX_BLOCKS_PER_AGENT = 2  # max times a single agent can block before being marked failed
 KEY_FILES = [
     "README.md", "requirements.txt", "setup.py", "pyproject.toml",
@@ -1168,6 +1173,43 @@ def _sync_generation_pipeline(
             {"response_mime_type": "application/json"},
         )
 
+        # --- Planner pre-validation ---
+        # Catch agents requesting files that don't exist in the repo.
+        # This is the #1 cause of block-spirals.
+        existing_files = {
+            str(p.relative_to(job_workspace)).replace("\\", "/")
+            for p in job_workspace.rglob("*")
+            if p.is_file() and ".git" not in p.parts
+        }
+        warnings = []
+        seed_artifacts = ["initial_goal", "repo_context"]
+        for agent in plan.agents:
+            missing = [f for f in agent.read_files if f not in existing_files]
+            if missing:
+                warnings.append(
+                    f"Agent '{agent.agent_name}' requests read_files that "
+                    f"do not exist: {missing}"
+                )
+            if not agent.depends_on:
+                bad_keys = [k for k in agent.input_keys if k not in seed_artifacts]
+                if bad_keys:
+                    warnings.append(
+                        f"Agent '{agent.agent_name}' references input_keys "
+                        f"not yet available: {bad_keys}"
+                    )
+        if warnings:
+            warning_text = "\n".join(f"- {w}" for w in warnings)
+            logger.warning(f"Job {job_id}: Plan issues:\n{warning_text}")
+            corrective = (
+                meta_prompt
+                + f"\n\nWARNING — your previous plan had these issues:\n"
+                  f"{warning_text}\nFix all of them in the new plan."
+            )
+            plan = sync_generate_and_parse(
+                job_planner, corrective, WorkflowPlan,
+                {"response_mime_type": "application/json"},
+            )
+
         # --- PHASE 2: AGENT DAG EXECUTION ---
         # Agents whose depends_on are satisfied run in parallel via a
         # ThreadPoolExecutor; the orchestrator wakes on FIRST_COMPLETED.
@@ -1223,10 +1265,17 @@ def _sync_generation_pipeline(
         review_schema = json.dumps(ReviewResult.model_json_schema(), indent=2)
 
         for cycle in range(review_cycles + 1):
+            # Cap per-file content for review. 6000 chars ≈ 150 lines — enough
+            # to see real issues without blowing the 8K context window.
+            REVIEW_FILE_CAP = 6000
             review_input = {
                 "goal": user_goal,
                 "files": [
-                    {"path": f.path, "content": f.content[:3000]}
+                    {
+                        "path": f.path,
+                        "content": f.content[:REVIEW_FILE_CAP],
+                        "truncated": len(f.content) > REVIEW_FILE_CAP,
+                    }
                     for f in delivery.files
                 ],
                 "commit_message": delivery.commit_message,
@@ -1267,8 +1316,9 @@ def _sync_generation_pipeline(
                 return
 
             update_job(job_id, current_step=f"review fix (cycle {cycle + 1})")
+            FIX_FILE_CAP = 6000
             rejected_files = [
-                {"path": f.path, "content": f.content[:3000]}
+                {"path": f.path, "content": f.content[:FIX_FILE_CAP]}
                 for f in delivery.files
             ]
             fix_prompt = (
