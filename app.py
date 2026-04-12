@@ -247,7 +247,7 @@ class OllamaModel:
 
         if self._openai_compat:
             # OpenAI-compatible path (vLLM, LM Studio, ngrok-proxied servers)
-            max_tok = min(int(config.get("max_output_tokens", 2048)), 2048)
+            max_tok = min(int(config.get("max_output_tokens", 4096)), 4090)
             payload = {
                 "model": self.model_name,
                 "messages": messages,
@@ -277,7 +277,7 @@ class OllamaModel:
                         )
                         # Context-length overflow: halve max_tokens and retry
                         if e.code == 400 and "context length" in err_body.lower():
-                            cur = payload_obj.get("max_tokens", 2048)
+                            cur = payload_obj.get("max_tokens", 4096)
                             reduced = max(cur // 2, 128)
                             if reduced < cur:
                                 logger.warning(
