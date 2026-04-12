@@ -319,6 +319,12 @@ class OllamaModel:
             body = _post_openai(payload)
 
             text = body.get("choices", [{}])[0].get("message", {}).get("content", "")
+            finish = body.get("choices", [{}])[0].get("finish_reason", "")
+            if finish == "length":
+                logger.warning(
+                    f"LLM output truncated (finish_reason=length, "
+                    f"{len(text)} chars). Prompt may exceed context window."
+                )
         else:
             # Native Ollama path
             payload = {
@@ -947,14 +953,29 @@ def sync_generate_and_parse(model, prompt, schema_class, config=None, max_retrie
             logger.warning(
                 f"Parse/validation failed (attempt {attempt + 1}): {e}"
             )
-            # Add corrective hint so the model stops echoing the schema
-            effective_prompt = (
-                prompt
-                + "\n\nIMPORTANT: Return a JSON object with actual values "
-                  "filled in. Do NOT return the schema definition itself. "
-                  "For example, if the schema says '\"approved\": bool', "
-                  "return '\"approved\": true' — not '\"approved\": {\"type\": \"boolean\"}'."
+            # Detect likely output truncation (unterminated string = JSON cut mid-way)
+            is_truncation = (
+                isinstance(e, json.JSONDecodeError)
+                and "unterminated" in str(e).lower()
             )
+            if is_truncation:
+                effective_prompt = (
+                    prompt
+                    + "\n\nCRITICAL: Your previous response was truncated "
+                      "mid-JSON because it was too long. You MUST produce a "
+                      "SHORTER, complete JSON response this time. Minimize "
+                      "file content — use only essential code, no comments or "
+                      "docstrings. Ensure the JSON is properly closed."
+                )
+            else:
+                # Add corrective hint so the model stops echoing the schema
+                effective_prompt = (
+                    prompt
+                    + "\n\nIMPORTANT: Return a JSON object with actual values "
+                      "filled in. Do NOT return the schema definition itself. "
+                      "For example, if the schema says '\"approved\": bool', "
+                      "return '\"approved\": true' — not '\"approved\": {\"type\": \"boolean\"}'."
+                )
             time.sleep(2 ** attempt)
 
 
@@ -1185,7 +1206,7 @@ def _sync_generation_pipeline(
             review_input = {
                 "goal": user_goal,
                 "files": [
-                    {"path": f.path, "content": f.content[:ARTIFACT_CHAR_LIMIT]}
+                    {"path": f.path, "content": f.content[:3000]}
                     for f in delivery.files
                 ],
                 "commit_message": delivery.commit_message,
@@ -1220,14 +1241,13 @@ def _sync_generation_pipeline(
 
             update_job(job_id, current_step=f"review fix (cycle {cycle + 1})")
             rejected_files = [
-                {"path": f.path, "content": f.content[:ARTIFACT_CHAR_LIMIT]}
+                {"path": f.path, "content": f.content[:3000]}
                 for f in delivery.files
             ]
             fix_prompt = (
                 f"The Reviewer rejected the DeliveryPlan with these issues:\n"
                 f"{json.dumps(review.issues)}\n"
                 f"Rejected files:\n{json.dumps(rejected_files)}\n"
-                f"Original artifacts:\n{json.dumps(artifact_context)}\n"
                 f"Fix ALL issues and regenerate the DeliveryPlan JSON:\n"
                 f"{delivery_schema}"
             )
