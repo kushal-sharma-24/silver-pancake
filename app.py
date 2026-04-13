@@ -15,6 +15,7 @@ import threading
 import concurrent.futures
 import urllib.request
 import urllib.error
+from enum import Enum
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, field_validator, ValidationError
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException, Header
@@ -78,6 +79,42 @@ logger.warning(
 # ============================================================================
 # 2. STRUCTURED SCHEMAS
 # ============================================================================
+
+# ── Lifecycle & failure enums ─────────────────────────────────────────────────
+
+class AgentStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    BLOCKED = "blocked"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    PRUNED = "pruned"
+
+
+class FailureClass(str, Enum):
+    JSON_PARSE = "json_parse"
+    CROSS_REF_BROKEN = "cross_ref_broken"
+    REVIEW_REJECTED = "review_rejected"
+    GIT_CONFLICT = "git_conflict"
+    LLM_TIMEOUT = "llm_timeout"
+    LLM_BLOCKED = "llm_blocked"
+    AGENT_BLOCKED = "agent_blocked"
+    HELPER_SPAWN_FAILED = "helper_spawn_failed"
+    BLOCK_LIMIT_EXCEEDED = "block_limit_exceeded"
+    DAG_STALLED = "dag_stalled"
+    CONTEXT_OVERFLOW = "context_overflow"
+    UNKNOWN = "unknown"
+
+
+class RecoveryAction(str, Enum):
+    RETRY_WITH_REPAIR = "retry_with_repair"
+    CORRECTIVE_PROMPT = "corrective_prompt"
+    SPAWN_HELPER = "spawn_helper"
+    VALIDATE_AND_FIX = "validate_and_fix"
+    ESCALATE = "escalate"
+    REDUCE_CONTEXT = "reduce_context"
+
+
 class AgentTask(BaseModel):
     agent_name: str
     role_description: str
@@ -86,6 +123,8 @@ class AgentTask(BaseModel):
     input_keys: List[str]
     read_files: List[str] = []
     output_format: str
+    scope: Optional[str] = None
+    acceptance_criteria: List[str] = []
 
 
 class WorkflowPlan(BaseModel):
@@ -160,6 +199,105 @@ class ReviewResult(BaseModel):
 
 class FileRequest(BaseModel):
     files_to_read: List[str]
+
+
+# ── Recovery recipes ──────────────────────────────────────────────────────────
+
+class RecoveryRecipe(BaseModel):
+    failure_class: FailureClass
+    actions: List[RecoveryAction]
+    max_attempts: int
+
+
+RECOVERY_RECIPES: Dict[FailureClass, RecoveryRecipe] = {
+    FailureClass.JSON_PARSE: RecoveryRecipe(
+        failure_class=FailureClass.JSON_PARSE,
+        actions=[RecoveryAction.RETRY_WITH_REPAIR, RecoveryAction.CORRECTIVE_PROMPT],
+        max_attempts=3,
+    ),
+    FailureClass.CROSS_REF_BROKEN: RecoveryRecipe(
+        failure_class=FailureClass.CROSS_REF_BROKEN,
+        actions=[RecoveryAction.VALIDATE_AND_FIX, RecoveryAction.CORRECTIVE_PROMPT],
+        max_attempts=2,
+    ),
+    FailureClass.REVIEW_REJECTED: RecoveryRecipe(
+        failure_class=FailureClass.REVIEW_REJECTED,
+        actions=[RecoveryAction.CORRECTIVE_PROMPT],
+        max_attempts=4,
+    ),
+    FailureClass.LLM_TIMEOUT: RecoveryRecipe(
+        failure_class=FailureClass.LLM_TIMEOUT,
+        actions=[RecoveryAction.REDUCE_CONTEXT, RecoveryAction.RETRY_WITH_REPAIR],
+        max_attempts=2,
+    ),
+    FailureClass.LLM_BLOCKED: RecoveryRecipe(
+        failure_class=FailureClass.LLM_BLOCKED,
+        actions=[RecoveryAction.ESCALATE],
+        max_attempts=0,
+    ),
+    FailureClass.AGENT_BLOCKED: RecoveryRecipe(
+        failure_class=FailureClass.AGENT_BLOCKED,
+        actions=[RecoveryAction.SPAWN_HELPER],
+        max_attempts=2,
+    ),
+    FailureClass.HELPER_SPAWN_FAILED: RecoveryRecipe(
+        failure_class=FailureClass.HELPER_SPAWN_FAILED,
+        actions=[RecoveryAction.ESCALATE],
+        max_attempts=0,
+    ),
+    FailureClass.BLOCK_LIMIT_EXCEEDED: RecoveryRecipe(
+        failure_class=FailureClass.BLOCK_LIMIT_EXCEEDED,
+        actions=[RecoveryAction.ESCALATE],
+        max_attempts=0,
+    ),
+    FailureClass.CONTEXT_OVERFLOW: RecoveryRecipe(
+        failure_class=FailureClass.CONTEXT_OVERFLOW,
+        actions=[RecoveryAction.REDUCE_CONTEXT],
+        max_attempts=2,
+    ),
+    FailureClass.GIT_CONFLICT: RecoveryRecipe(
+        failure_class=FailureClass.GIT_CONFLICT,
+        actions=[RecoveryAction.ESCALATE],
+        max_attempts=0,
+    ),
+    FailureClass.DAG_STALLED: RecoveryRecipe(
+        failure_class=FailureClass.DAG_STALLED,
+        actions=[RecoveryAction.ESCALATE],
+        max_attempts=0,
+    ),
+    FailureClass.UNKNOWN: RecoveryRecipe(
+        failure_class=FailureClass.UNKNOWN,
+        actions=[RecoveryAction.ESCALATE],
+        max_attempts=1,
+    ),
+}
+
+
+def classify_failure(error: Exception) -> FailureClass:
+    """Classify an exception into a FailureClass for targeted recovery."""
+    msg = str(error).lower()
+    if isinstance(error, json.JSONDecodeError):
+        return FailureClass.JSON_PARSE
+    if isinstance(error, subprocess.CalledProcessError):
+        if "conflict" in msg or "merge" in msg:
+            return FailureClass.GIT_CONFLICT
+        return FailureClass.UNKNOWN
+    if "timeout" in msg or "timed out" in msg:
+        return FailureClass.LLM_TIMEOUT
+    if "safety" in msg or "blocked by safety" in msg:
+        return FailureClass.LLM_BLOCKED
+    if "context length" in msg or "context window" in msg:
+        return FailureClass.CONTEXT_OVERFLOW
+    return FailureClass.UNKNOWN
+
+
+class JobEvent(BaseModel):
+    t: int
+    type: str
+    agent: Optional[str] = None
+    failure_class: Optional[FailureClass] = None
+    detail: Optional[str] = None
+    data: Optional[dict] = None
 
 
 # ============================================================================
@@ -432,18 +570,29 @@ def create_job(job_id: str, goal: str) -> Dict[str, Any]:
         "result": None,
         "error": None,
         "events": [],
+        "agent_states": {},
     }
     with _jobs_lock:
         _jobs[job_id] = job
     return job
 
 
-def append_job_event(job_id: str, event_type: str, **data):
-    """Append a timestamped event to the job's event log (thread-safe)."""
+def append_job_event(job_id: str, event_type: str, failure_class=None, **data):
+    """Append a timestamped, optionally failure-typed event to the job log."""
     entry = {"t": int(time.time() * 1000), "type": event_type, **data}
+    if failure_class is not None:
+        entry["failure_class"] = failure_class
     with _jobs_lock:
         if job_id in _jobs:
             _jobs[job_id]["events"].append(entry)
+
+
+def set_agent_state(job_id: str, agent_name: str, status) -> None:
+    """Update the lifecycle state of a specific agent (thread-safe)."""
+    val = status.value if hasattr(status, 'value') else str(status)
+    with _jobs_lock:
+        if job_id in _jobs:
+            _jobs[job_id]["agent_states"][agent_name] = val
 
 
 # ============================================================================
@@ -594,6 +743,79 @@ def read_artifact_context(
     return context
 
 
+def validate_cross_references(files: List[FileArtifact]) -> List[str]:
+    """Check that Python imports between delivered files actually resolve.
+
+    Returns a list of human-readable issue strings. An empty list means
+    all cross-references look OK. Only checks imports that reference
+    other files in the delivery — stdlib and pip packages are ignored.
+    """
+    delivered_modules = set()
+    for f in files:
+        p = pathlib.PurePosixPath(f.path)
+        if p.suffix == ".py":
+            stem = p.with_suffix("")
+            delivered_modules.add(stem.name)
+            delivered_modules.add(str(stem).replace("/", "."))
+
+    _COMMON_STDLIB = frozenset({
+        "abc", "argparse", "ast", "asyncio", "base64", "bisect", "builtins",
+        "calendar", "cgi", "cmd", "codecs", "collections", "colorsys",
+        "configparser", "contextlib", "copy", "csv", "ctypes", "dataclasses",
+        "datetime", "decimal", "difflib", "dis", "email", "enum", "errno",
+        "fcntl", "fileinput", "fnmatch", "fractions", "ftplib", "functools",
+        "gc", "getpass", "glob", "gzip", "hashlib", "heapq", "hmac", "html",
+        "http", "importlib", "inspect", "io", "ipaddress", "itertools", "json",
+        "logging", "lzma", "math", "mimetypes", "multiprocessing", "numbers",
+        "operator", "os", "pathlib", "pickle", "platform", "pprint",
+        "queue", "random", "re", "readline", "reprlib", "secrets", "select",
+        "shelve", "shlex", "shutil", "signal", "site", "smtplib", "socket",
+        "sqlite3", "ssl", "stat", "statistics", "string", "struct",
+        "subprocess", "sys", "syslog", "tempfile", "textwrap", "threading",
+        "time", "timeit", "tkinter", "token", "tokenize", "tomllib", "trace",
+        "traceback", "tracemalloc", "turtle", "types", "typing",
+        "unicodedata", "unittest", "urllib", "uuid", "venv", "warnings",
+        "wave", "weakref", "webbrowser", "xml", "xmlrpc", "zipfile", "zipimport",
+        "zlib",
+        # Common pip packages
+        "flask", "django", "fastapi", "uvicorn", "gunicorn", "requests",
+        "httpx", "aiohttp", "numpy", "pandas", "scipy", "matplotlib",
+        "seaborn", "plotly", "sklearn", "tensorflow", "torch", "pydantic",
+        "sqlalchemy", "alembic", "celery", "redis", "boto3", "google",
+        "openai", "anthropic", "pytest", "click", "typer", "rich",
+        "yaml", "toml", "dotenv", "jwt", "cryptography", "paramiko",
+        "PIL", "cv2", "pygame", "chess",
+    })
+
+    def _looks_local(module_name, file_content):
+        if f"{module_name}.py" in file_content:
+            return True
+        if "_" in module_name and module_name.islower():
+            return True
+        if module_name.islower() and len(module_name) <= 20:
+            return True
+        return False
+
+    issues: List[str] = []
+    import_re = re.compile(
+        r"^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))", re.MULTILINE,
+    )
+    for f in files:
+        if not f.path.endswith(".py"):
+            continue
+        for m in import_re.finditer(f.content):
+            module = (m.group(1) or m.group(2)).split(".")[0]
+            if module in _COMMON_STDLIB:
+                continue
+            if module not in delivered_modules and _looks_local(module, f.content):
+                issues.append(
+                    f"'{f.path}' imports '{module}' which is not delivered "
+                    f"as a .py file in this plan. Either add '{module}.py' "
+                    f"to the delivery or inline the code."
+                )
+    return issues
+
+
 # ============================================================================
 # 6. DAG EXECUTION ENGINE
 # ============================================================================
@@ -741,6 +963,10 @@ def execute_dag(
     dynamic_agent_count = 0
     block_counts: Dict[str, int] = {}  # per-agent block counter
 
+    # Initialize agent lifecycle states
+    for name in remaining:
+        set_agent_state(job_id, name, AgentStatus.PENDING)
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         while remaining or futures:
             # --- Prune agents whose dependencies have failed ---
@@ -760,6 +986,7 @@ def execute_dag(
                     )
                     failed.add(name)
                     del remaining[name]
+                    set_agent_state(job_id, name, AgentStatus.PRUNED)
                     append_job_event(job_id, "agent_pruned", agent=name)
                     pruned = True
 
@@ -774,6 +1001,7 @@ def execute_dag(
                     dag_executor, llm_provider, ollama_model, ollama_base_url,
                 )
                 del remaining[agent.agent_name]
+                set_agent_state(job_id, agent.agent_name, AgentStatus.RUNNING)
                 append_job_event(job_id, "agent_started", agent=agent.agent_name)
 
             # Update status: show all concurrently running agent names
@@ -821,8 +1049,10 @@ def execute_dag(
                                 f"{block_counts[name]} times — giving up."
                             )
                             failed.add(name)
+                            set_agent_state(job_id, name, AgentStatus.FAILED)
                             append_job_event(
                                 job_id, "agent_failed", agent=name,
+                                failure_class=FailureClass.BLOCK_LIMIT_EXCEEDED,
                                 error=(
                                     f"Blocked {block_counts[name]} times, "
                                     f"exceeded MAX_BLOCKS_PER_AGENT"
@@ -855,6 +1085,8 @@ def execute_dag(
                                 remaining[name] = requeued
                                 agent_registry[helper.agent_name] = helper
                                 agent_registry[name] = requeued
+                                set_agent_state(job_id, name, AgentStatus.BLOCKED)
+                                set_agent_state(job_id, helper.agent_name, AgentStatus.PENDING)
                                 append_job_event(
                                     job_id, "helper_spawned",
                                     blocked_agent=name,
@@ -873,8 +1105,10 @@ def execute_dag(
                                     f"for '{name}': {spawn_err} — marking failed."
                                 )
                                 failed.add(name)
+                                set_agent_state(job_id, name, AgentStatus.FAILED)
                                 append_job_event(
                                     job_id, "agent_failed", agent=name,
+                                    failure_class=FailureClass.HELPER_SPAWN_FAILED,
                                     error=f"Helper spawn failed: {spawn_err}",
                                 )
                         else:
@@ -884,12 +1118,15 @@ def execute_dag(
                                 f"reached — marking failed."
                             )
                             failed.add(name)
+                            set_agent_state(job_id, name, AgentStatus.FAILED)
                             append_job_event(
                                 job_id, "agent_failed", agent=name,
+                                failure_class=FailureClass.AGENT_BLOCKED,
                                 error="Blocked and max dynamic agents reached",
                             )
                     else:
                         completed.add(name)
+                        set_agent_state(job_id, name, AgentStatus.COMPLETED)
                         append_job_event(
                             job_id, "agent_done", agent=name,
                             completed=len(completed), total=len(agent_registry),
@@ -899,9 +1136,11 @@ def execute_dag(
                             f"{len(completed)}/{len(agent_registry)} complete"
                         )
                 except Exception as e:
+                    fc = classify_failure(e)
                     failed.add(name)
-                    append_job_event(job_id, "agent_failed", agent=name, error=str(e))
-                    logger.error(f"Job {job_id}: '{name}' ✗ — {e}")
+                    set_agent_state(job_id, name, AgentStatus.FAILED)
+                    append_job_event(job_id, "agent_failed", agent=name, failure_class=fc, error=str(e))
+                    logger.error(f"Job {job_id}: '{name}' ✗ [{fc.value}] — {e}")
                 del futures[name]
 
     return len(completed), len(failed), len(agent_registry)
@@ -1250,6 +1489,7 @@ def _sync_generation_pipeline(
         if dag_total > 0 and dag_ok < dag_total * 0.5:
             update_job(
                 job_id, status="failed", current_step="dag_incomplete",
+                failure_class=FailureClass.DAG_STALLED,
                 error=(
                     f"DAG too degraded: only {dag_ok}/{dag_total} agents "
                     f"completed ({dag_fail} failed). Aborting — not enough "
@@ -1278,13 +1518,45 @@ def _sync_generation_pipeline(
             f"merge them into a single coherent implementation inside the main file or a "
             f"co-delivered module.\n"
             f"- Include a requirements.txt ONLY with real pip-installable packages.\n"
-            f"- Include complete, actually runnable code \u2014 not stubs or pseudocode.\n\n"
+            f"- Include complete, actually runnable code \u2014 not stubs or pseudocode.\n"
+            f"CROSS-FILE REFERENCES (CRITICAL):\n"
+            f"- Before writing any import statement like 'from X import Y', verify that "
+            f"module X exists as another file in your delivery (e.g. X.py).\n"
+            f"- If you define a function/class in one file and import it in another, "
+            f"the EXACT function/class name must match between the files.\n"
+            f"- Prefer fewer, larger files over many small files to reduce cross-file risk.\n"
+            f"- If in doubt, put everything in a single file.\n\n"
             f"Generate a DeliveryPlan JSON:\n{delivery_schema}"
         )
         delivery = sync_generate_and_parse(
             job_executor, delivery_prompt, DeliveryPlan,
             {"response_mime_type": "application/json"},
+            max_retries=4,
         )
+
+        # --- Structural pre-review: catch broken cross-references early ---
+        xref_issues = validate_cross_references(delivery.files)
+        if xref_issues:
+            xref_text = "\n".join(f"- {i}" for i in xref_issues)
+            logger.warning(f"Job {job_id}: Cross-reference issues:\n{xref_text}")
+            update_job(job_id, current_step="fixing cross-references")
+            file_manifest = [f.path for f in delivery.files]
+            delivery = sync_generate_and_parse(
+                job_executor,
+                f"The delivery has BROKEN CROSS-FILE REFERENCES:\n{xref_text}\n\n"
+                f"Current files in delivery: {file_manifest}\n"
+                f"Current file contents:\n"
+                f"{json.dumps([{'path': f.path, 'content': f.content[:ARTIFACT_CHAR_LIMIT]} for f in delivery.files])}\n\n"
+                f"FIX RULES:\n"
+                f"- For each broken import, either add the missing .py file to the delivery "
+                f"OR move the imported code inline into the file that needs it.\n"
+                f"- Verify EVERY 'from X import Y' has a matching file X.py with Y defined.\n"
+                f"- Output the COMPLETE fixed delivery.\n\n"
+                f"Regenerate the full DeliveryPlan JSON:\n{delivery_schema}",
+                DeliveryPlan,
+                {"response_mime_type": "application/json"},
+                max_retries=4,
+            )
 
         # --- PHASE 4: REVIEW & RETRY LOOP ---
         update_job(job_id, current_step="self-review")
@@ -1333,6 +1605,7 @@ def _sync_generation_pipeline(
                 update_job(
                     job_id, status="failed",
                     current_step="review_rejected",
+                    failure_class=FailureClass.REVIEW_REJECTED,
                     error=(
                         f"Team '{plan.team_name}' failed review after "
                         f"{review_cycles + 1} attempts.\n"
@@ -1347,9 +1620,11 @@ def _sync_generation_pipeline(
                 {"path": f.path, "content": f.content[:FIX_FILE_CAP]}
                 for f in delivery.files
             ]
+            file_manifest = [f.path for f in delivery.files]
             fix_prompt = (
                 f"A code reviewer REJECTED the delivery with these issues:\n"
                 f"{json.dumps(review.issues)}\n\n"
+                f"Files in current delivery: {file_manifest}\n"
                 f"Current files (fix these):\n{json.dumps(rejected_files)}\n\n"
                 f"RULES FOR FIXING:\n"
                 f"- Fix EVERY issue listed above.\n"
@@ -1357,6 +1632,8 @@ def _sync_generation_pipeline(
                 f"pip packages, or other files in this delivery.\n"
                 f"- If a missing module is referenced, implement it INLINE in the relevant file "
                 f"or as a co-delivered .py file.\n"
+                f"- For EVERY 'from X import Y' in any file, verify X.py exists in the delivery "
+                f"and Y is actually defined in X.py.\n"
                 f"- Output COMPLETE file contents, not patches or diffs.\n"
                 f"- Do NOT introduce new external dependencies that don't exist on PyPI.\n\n"
                 f"Regenerate the full DeliveryPlan JSON:\n{delivery_schema}"
@@ -1364,6 +1641,7 @@ def _sync_generation_pipeline(
             delivery = sync_generate_and_parse(
                 job_executor, fix_prompt, DeliveryPlan,
                 {"response_mime_type": "application/json"},
+                max_retries=4,
             )
 
         # --- PHASE 5: PR WORKFLOW ---
@@ -1436,13 +1714,15 @@ def _sync_generation_pipeline(
         )
 
     except Exception as e:
-        logger.exception(f"Job {job_id} failed")
+        fc = classify_failure(e)
+        logger.exception(f"Job {job_id} failed [{fc.value}]")
         detail = str(e)
         if isinstance(e, subprocess.CalledProcessError) and e.stderr:
             detail = f"{detail} | stderr: {e.stderr.strip()[:500]}"
         update_job(
             job_id, status="failed", current_step="error",
-            error=f"Orchestration failed: {type(e).__name__}: {detail}",
+            failure_class=fc,
+            error=f"Orchestration failed [{fc.value}]: {type(e).__name__}: {detail}",
         )
     finally:
         shutil.rmtree(job_workspace, ignore_errors=True)
