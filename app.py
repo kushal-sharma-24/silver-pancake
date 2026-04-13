@@ -20,7 +20,7 @@ from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, field_validator, ValidationError
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException, Header
 from fastapi.responses import JSONResponse, StreamingResponse
-import google.generativeai as genai
+from google import genai
 
 # ============================================================================
 # 1. SETUP & FAST-FAIL
@@ -60,8 +60,10 @@ _GIT_AUTH_HEADER = (
     + base64.b64encode(f"x-access-token:{GITHUB_PAT}".encode()).decode()
 )
 
+# Initialise Gemini client (new google-genai SDK)
+_gemini_client = None
 if GEMINI_KEY:
-    genai.configure(api_key=GEMINI_KEY)
+    _gemini_client = genai.Client(api_key=GEMINI_KEY)
 else:
     logger.warning("GEMINI_API_KEY not set — 'gemini' provider will be unavailable.")
 
@@ -329,6 +331,35 @@ _FIXER_INSTRUCTION = (
 )
 
 
+# ── GeminiModel wrapper (native structured output via google-genai SDK) ────
+class GeminiModel:
+    """Wrapper around the google-genai Client for structured output."""
+
+    def __init__(self, model_name: str = "gemini-2.5-flash", system_instruction: str = ""):
+        self.model_name = model_name
+        self.system_instruction = system_instruction or ""
+
+    def generate_content(self, prompt, generation_config=None):
+        config = dict(generation_config or {})
+        if self.system_instruction:
+            config["system_instruction"] = self.system_instruction
+        schema_class = config.pop("response_schema", None)
+        if schema_class is not None:
+            config["response_mime_type"] = "application/json"
+            config["response_json_schema"] = schema_class.model_json_schema()
+        elif config.get("response_mime_type") == "application/json":
+            pass
+        resp = _gemini_client.models.generate_content(
+            model=self.model_name,
+            contents=prompt,
+            config=config,
+        )
+        text = resp.text or ""
+        if not text:
+            raise ValueError("AI returned an empty response.")
+        return _OllamaResponse(text)
+
+
 # --- Ollama drop-in replacement for genai.GenerativeModel ---
 class _OllamaPart:
     def __init__(self, text: str):
@@ -398,6 +429,17 @@ class OllamaModel:
                 "temperature": 0.7,
                 "stream": False,
             }
+            # Pass structured output schema if provided
+            schema_class = config.get("response_schema")
+            if schema_class is not None:
+                payload["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema_class.__name__,
+                        "schema": schema_class.model_json_schema(),
+                        "strict": False,
+                    },
+                }
             target_url = f"{self.base_url}/v1/chat/completions"
 
             def _post_openai(payload_obj):
@@ -455,10 +497,6 @@ class OllamaModel:
                     f"LLM request failed at {target_url}"
                 )
 
-            # Never send response_format to OpenAI-compat endpoints — vLLM 0.7.x
-            # crashes fatally (xgrammar incompatibility) when json_object guided
-            # decoding is requested. The model still outputs JSON because the
-            # system prompt instructs "Output ONLY JSON".
             body = _post_openai(payload)
 
             text = body.get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -475,7 +513,11 @@ class OllamaModel:
                 "messages": messages,
                 "stream": False,
             }
-            if config.get("response_mime_type") == "application/json":
+            # Native Ollama supports format: "json" or a full JSON Schema object
+            schema_class = config.get("response_schema")
+            if schema_class is not None:
+                payload["format"] = schema_class.model_json_schema()
+            elif config.get("response_mime_type") == "application/json":
                 payload["format"] = "json"
 
             data = json.dumps(payload).encode("utf-8")
@@ -502,9 +544,9 @@ def _create_model(provider: str, system_instruction: str, ollama_model: str = ""
     """Factory: build a model object for the given provider."""
     if provider == "ollama":
         return OllamaModel(ollama_model or OLLAMA_MODEL, system_instruction, ollama_base_url)
-    if not GEMINI_KEY:
+    if not _gemini_client:
         raise RuntimeError("Gemini requested but GEMINI_API_KEY is not set.")
-    return genai.GenerativeModel(
+    return GeminiModel(
         model_name="gemini-2.5-flash",
         system_instruction=system_instruction,
     )
@@ -521,7 +563,7 @@ def create_models(provider: str = "gemini", ollama_model: str = "", ollama_base_
 
 
 # Default Gemini model instances (used when provider is not overridden)
-if GEMINI_KEY:
+if _gemini_client:
     planner_model, executor_model, reviewer_model, fixer_model = create_models("gemini")
 else:
     planner_model = executor_model = reviewer_model = fixer_model = None
@@ -695,7 +737,7 @@ def write_files(files: List[FileArtifact], workspace: pathlib.Path):
     for f in files:
         target = (workspace / f.path).resolve()
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(f.content)
+        target.write_text(f.content, encoding="utf-8")
 
 
 def read_agent_files(
@@ -870,7 +912,7 @@ def _run_single_agent(
     except Exception as e:
         logger.warning(f"Agent '{agent.agent_name}' failed: {e}")
         (artifacts_dir / f"{agent.agent_name}.txt").write_text(
-            f"[AGENT FAILED: {type(e).__name__}]"
+            f"[AGENT FAILED: {type(e).__name__}]", encoding="utf-8"
         )
         raise RuntimeError(f"Agent '{agent.agent_name}' failed: {e}") from e
 
@@ -887,13 +929,13 @@ def _run_single_agent(
             reason = str(parsed.get("reason", "No reason provided."))[:500]
             logger.info(f"Agent '{agent.agent_name}' blocked: {reason}")
             (artifacts_dir / f"{agent.agent_name}_BLOCKED.json").write_text(
-                json.dumps({"reason": reason})
+                json.dumps({"reason": reason}), encoding="utf-8"
             )
             return agent.agent_name  # normal return; execute_dag re-queues
     except (json.JSONDecodeError, AttributeError):
         pass  # output is plain text or non-blocked JSON — treat as normal
 
-    (artifacts_dir / f"{agent.agent_name}.txt").write_text(output)
+    (artifacts_dir / f"{agent.agent_name}.txt").write_text(output, encoding="utf-8")
     return agent.agent_name
 
 
@@ -910,7 +952,6 @@ def _spawn_helper_agent(
     depends_on entry pointing at the helper's agent_name.
     """
     available_keys = [p.stem for p in artifacts_dir.glob("*.txt")]
-    task_schema = json.dumps(AgentTask.model_json_schema(), indent=2)
     prompt = (
         f"An agent named '{blocked_agent.agent_name}' "
         f"(role: '{blocked_agent.role_description}') cannot proceed.\n"
@@ -918,17 +959,18 @@ def _spawn_helper_agent(
         f"Artifact keys already available on disk: {available_keys}\n"
         f"Synthesize exactly ONE AgentTask JSON that produces the missing "
         f"information and writes it as its output.\n"
+        f"The JSON must have: agent_name, role_description, depends_on (must be []),\n"
+        f"input_keys (from available keys above), read_files, output_format.\n"
         f"Rules:\n"
         f"- agent_name must be unique, snake_case, and clearly name the helper.\n"
         f"- depends_on MUST be [] — the helper runs on the very next tick.\n"
         f"- input_keys must only reference keys from: {available_keys}.\n"
-        f"- Scope is minimal — solve only the stated blocker, nothing more.\n"
-        f"Return JSON matching:\n{task_schema}"
+        f"- Scope is minimal — solve only the stated blocker, nothing more."
     )
     _planner = planner or planner_model
     return sync_generate_and_parse(
         _planner, prompt, AgentTask,
-        {"response_mime_type": "application/json"},
+        {},
     )
 
 
@@ -1168,15 +1210,19 @@ def sync_generate_with_retry(model, prompt, config=None, max_retries=2):
 
 
 def sync_generate_and_parse(model, prompt, schema_class, config=None, max_retries=2):
-    """Synchronous generate + parse + validate with retry.
+    """Generate + JSON-parse + Pydantic-validate with corrective retry.
 
-    Detects when a small model echoes back the JSON Schema definition
-    instead of filling in values, and adds a corrective hint on retry.
+    The schema_class is passed to the LLM provider via API-level structured
+    output (Gemini response_schema / OpenAI json_schema / Ollama format).
+    The schema is NEVER dumped into the prompt text.
     """
+    effective_config = dict(config or {})
+    effective_config["response_schema"] = schema_class
+
     effective_prompt = prompt
     for attempt in range(max_retries + 1):
         try:
-            text = sync_generate_with_retry(model, effective_prompt, config, max_retries=0)
+            text = sync_generate_with_retry(model, effective_prompt, effective_config, max_retries=0)
             # Strip markdown fences that small models occasionally emit
             text = re.sub(r"^\s*```(?:json)?\s*\n?", "", text, flags=re.IGNORECASE)
             text = re.sub(r"\n?\s*```\s*$", "", text).strip()
@@ -1400,17 +1446,18 @@ def _sync_generation_pipeline(
         repo_context = get_repo_summary(job_workspace)
 
         # Seed the file-based artifact store with the two root contexts
-        (artifacts_dir / "initial_goal.txt").write_text(user_goal)
-        (artifacts_dir / "repo_context.txt").write_text(repo_context)
+        (artifacts_dir / "initial_goal.txt").write_text(user_goal, encoding="utf-8")
+        (artifacts_dir / "repo_context.txt").write_text(repo_context, encoding="utf-8")
 
         update_job(job_id, current_step="planning")
 
         # --- PHASE 1: PLAN ---
-        plan_schema = json.dumps(WorkflowPlan.model_json_schema(), indent=2)
         meta_prompt = (
             f"Goal: '{user_goal}'.\n"
             f"Repo Context:\n{repo_context}\n"
-            f"Decompose into a WorkflowPlan (max 8 agents):\n{plan_schema}\n"
+            f"Return a JSON WorkflowPlan with 'team_name' (string) and 'agents' "
+            f"(array of objects, each with: agent_name, role_description, depends_on, "
+            f"input_keys, read_files, output_format, optionally system_instruction). Max 8 agents.\n"
             f"Rules:\n"
             f"- First agent's input_keys must include 'initial_goal' and "
             f"'repo_context'.\n"
@@ -1435,7 +1482,7 @@ def _sync_generation_pipeline(
         )
         plan = sync_generate_and_parse(
             job_planner, meta_prompt, WorkflowPlan,
-            {"response_mime_type": "application/json"},
+            {},
         )
 
         # --- Planner pre-validation ---
@@ -1472,7 +1519,7 @@ def _sync_generation_pipeline(
             )
             plan = sync_generate_and_parse(
                 job_planner, corrective, WorkflowPlan,
-                {"response_mime_type": "application/json"},
+                {},
             )
 
         # --- PHASE 2: AGENT DAG EXECUTION ---
@@ -1504,10 +1551,11 @@ def _sync_generation_pipeline(
         # 16 000 chars ≈ 4 000 tokens; leaves room for schema + completion in 8 K models.
         all_keys = [p.stem for p in artifacts_dir.glob("*.txt")]
         artifact_context = read_artifact_context(all_keys, artifacts_dir, max_budget=16000)
-        delivery_schema = json.dumps(DeliveryPlan.model_json_schema(), indent=2)
         delivery_prompt = (
             f"TASK: Synthesize all agent artifacts into production-ready, self-contained files.\n\n"
             f"Artifacts from agents:\n{json.dumps(artifact_context)}\n\n"
+            f"Return a JSON DeliveryPlan with 'files' (array of objects with 'path' and 'content'), "
+            f"'commit_message' (string), and 'pr_title' (string).\n\n"
             f"RULES:\n"
             f"- Merge ALL code from the artifacts into complete, runnable source files.\n"
             f"- Every file must be self-contained: all imports must resolve to the standard "
@@ -1525,12 +1573,11 @@ def _sync_generation_pipeline(
             f"- If you define a function/class in one file and import it in another, "
             f"the EXACT function/class name must match between the files.\n"
             f"- Prefer fewer, larger files over many small files to reduce cross-file risk.\n"
-            f"- If in doubt, put everything in a single file.\n\n"
-            f"Generate a DeliveryPlan JSON:\n{delivery_schema}"
+            f"- If in doubt, put everything in a single file."
         )
         delivery = sync_generate_and_parse(
             job_executor, delivery_prompt, DeliveryPlan,
-            {"response_mime_type": "application/json"},
+            {},
             max_retries=4,
         )
 
@@ -1551,16 +1598,14 @@ def _sync_generation_pipeline(
                 f"- For each broken import, either add the missing .py file to the delivery "
                 f"OR move the imported code inline into the file that needs it.\n"
                 f"- Verify EVERY 'from X import Y' has a matching file X.py with Y defined.\n"
-                f"- Output the COMPLETE fixed delivery.\n\n"
-                f"Regenerate the full DeliveryPlan JSON:\n{delivery_schema}",
+                f"- Output the COMPLETE fixed delivery (files array, commit_message, pr_title).",
                 DeliveryPlan,
-                {"response_mime_type": "application/json"},
+                {},
                 max_retries=4,
             )
 
         # --- PHASE 4: REVIEW & RETRY LOOP ---
         update_job(job_id, current_step="self-review")
-        review_schema = json.dumps(ReviewResult.model_json_schema(), indent=2)
 
         for cycle in range(review_cycles + 1):
             # Cap per-file content for review. 6000 chars ≈ 150 lines — enough
@@ -1590,11 +1635,11 @@ def _sync_generation_pipeline(
                 f"- Do NOT reject for missing features the user didn't ask for.\n"
                 f"- Do NOT reject because a module is implemented inline instead of as a package.\n"
                 f"- Each issue in your list must describe a SPECIFIC problem and HOW to fix it.\n"
-                f"Return JSON matching:\n{review_schema}"
+                f"Return a JSON object with 'approved' (boolean) and 'issues' (array of strings)."
             )
             review = sync_generate_and_parse(
                 job_reviewer, review_prompt, ReviewResult,
-                {"response_mime_type": "application/json"},
+                {},
             )
 
             if review.approved:
@@ -1636,11 +1681,11 @@ def _sync_generation_pipeline(
                 f"and Y is actually defined in X.py.\n"
                 f"- Output COMPLETE file contents, not patches or diffs.\n"
                 f"- Do NOT introduce new external dependencies that don't exist on PyPI.\n\n"
-                f"Regenerate the full DeliveryPlan JSON:\n{delivery_schema}"
+                f"Return the complete fixed DeliveryPlan with 'files', 'commit_message', and 'pr_title'."
             )
             delivery = sync_generate_and_parse(
                 job_executor, fix_prompt, DeliveryPlan,
-                {"response_mime_type": "application/json"},
+                {},
                 max_retries=4,
             )
 
@@ -1862,17 +1907,16 @@ def _sync_pr_revision(
         # 4. Investigation: which files does the fixer need?
         repo_tree = get_repo_summary(job_workspace, max_chars=3000)
 
-        req_schema = json.dumps(FileRequest.model_json_schema(), indent=2)
         inv_prompt = (
             f"User commented on a PR: '{comment_body}'\n"
             f"PR diff against {BASE_BRANCH}:\n{pr_diff}\n"
             f"Repo file tree:\n{repo_tree}\n"
             f"Which files (max {MAX_READ_FILES}) do you need to read to "
-            f"address this comment? Return JSON:\n{req_schema}"
+            f"address this comment? Return a JSON with 'files_to_read' (array of file paths)."
         )
         file_req = sync_generate_and_parse(
             rev_fixer, inv_prompt, FileRequest,
-            {"response_mime_type": "application/json"},
+            {},
         )
 
         # 5. Read requested files
@@ -1881,21 +1925,20 @@ def _sync_pr_revision(
         )
 
         # 6. Generate the fix
-        deliv_schema = json.dumps(DeliveryPlan.model_json_schema(), indent=2)
         fix_prompt = (
             f"User Comment: '{comment_body}'\n"
             f"PR diff against {BASE_BRANCH}:\n{pr_diff}\n"
             f"Existing Files:\n{json.dumps(file_context)}\n"
             f"Fix ONLY what the user asked for. Do not revert other changes.\n"
-            f"Return a DeliveryPlan JSON:\n{deliv_schema}"
+            f"Return a JSON DeliveryPlan with 'files' (array of {{path, content}}), "
+            f"'commit_message', and 'pr_title'."
         )
         delivery = sync_generate_and_parse(
             rev_fixer, fix_prompt, DeliveryPlan,
-            {"response_mime_type": "application/json"},
+            {},
         )
 
         # 7. Review gate
-        review_schema = json.dumps(ReviewResult.model_json_schema(), indent=2)
         review_input = {
             "comment": comment_body,
             "files": [
@@ -1906,11 +1949,12 @@ def _sync_pr_revision(
         review_prompt = (
             f"Review this fix against the user comment: '{comment_body}'\n"
             f"Files to commit:\n{json.dumps(review_input, indent=2)}\n"
-            f"Is this fix correct and minimal? Return JSON:\n{review_schema}"
+            f"Is this fix correct and minimal? Return a JSON with 'approved' (boolean) "
+            f"and 'issues' (array of strings)."
         )
         review = sync_generate_and_parse(
             rev_reviewer, review_prompt, ReviewResult,
-            {"response_mime_type": "application/json"},
+            {},
         )
 
         if not review.approved:
