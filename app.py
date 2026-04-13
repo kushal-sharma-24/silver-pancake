@@ -343,12 +343,11 @@ class GeminiModel:
         config = dict(generation_config or {})
         if self.system_instruction:
             config["system_instruction"] = self.system_instruction
-        schema_class = config.pop("response_schema", None)
-        if schema_class is not None:
+        # If response_schema is set, ensure JSON mode is on.
+        # Leave response_schema in the config so the SDK's t.t_schema()
+        # resolves $ref/$defs and converts types to Gemini-native format.
+        if config.get("response_schema") is not None:
             config["response_mime_type"] = "application/json"
-            config["response_json_schema"] = schema_class.model_json_schema()
-        elif config.get("response_mime_type") == "application/json":
-            pass
         resp = _gemini_client.models.generate_content(
             model=self.model_name,
             contents=prompt,
