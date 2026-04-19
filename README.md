@@ -1,1 +1,1 @@
-# silver-pancake
+# Chess Game\n\nA terminal-based chess game where you play as White against a heuristic AI bot.\n\n## How to Play\n\n```bash\npython chess_game.py\n```\n\nEnter moves in coordinate notation: `e2e4`, `g1f3`, etc.\nFor pawn promotion, append the piece letter: `e7e8q`\nType `quit` to exit.\n\n## Bot Algorithm\n\nThe bot uses a depth-limited minimax search (depth 3) with alpha-beta pruning.\nIt evaluates positions using material values and piece-square tables.\nThis is a heuristic approach — not brute force.\n
