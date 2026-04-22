@@ -1,0 +1,52 @@
+# ---- Stage 1: Builder ----
+FROM python:3.11.9-slim AS builder
+
+WORKDIR /build
+
+COPY requirements.txt .
+
+RUN python -m venv /opt/venv && \
+    /opt/venv/bin/pip install --no-cache-dir --upgrade pip && \
+    /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
+
+# ---- Stage 2: Runtime ----
+FROM python:3.11.9-slim
+
+# Install runtime system dependencies: git (for repo operations) and curl (for healthcheck)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git curl && \
+    rm -rf /var/lib/apt/lists/*
+
+# Configure git for the pipeline agent
+RUN git config --global user.email "agent@pipeline.local" && \
+    git config --global user.name "AI Pipeline Agent"
+
+# Create non-root user
+RUN groupadd --gid 1000 appuser && \
+    useradd --uid 1000 --gid 1000 --create-home appuser
+
+WORKDIR /app
+
+# Copy virtualenv from builder stage
+COPY --from=builder /opt/venv /opt/venv
+
+# Copy only the source files needed at runtime
+COPY app.py config.py models.py llm.py dag.py job_store.py git_utils.py workspace.py ./
+COPY routes/ ./routes/
+COPY requirements.txt .
+
+# Ensure venv is on PATH
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# Set ownership and switch to non-root user
+RUN chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 80
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:80/health || exit 1
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "80"]

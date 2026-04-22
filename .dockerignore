@@ -1,0 +1,43 @@
+# Directories not needed in production image
+business-case/
+docs/
+sandbox/
+legacy/
+dashboard/
+client/
+pipeline-docs/
+
+# Version control
+.git/
+.github/
+.gitignore
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Environment and secrets
+.env
+.env.*
+
+# Runtime data
+*.db
+*.log
+*.jsonl
+
+# IDE and OS
+.vscode/
+*.code-workspace
+.DS_Store
+Thumbs.db
+
+# Documentation
+README.md
+*.md
+!requirements.txt
+
+# Notebooks and experiments
+*.ipynb
+travel-expert-notebook.ipynb
