@@ -1,0 +1,12 @@
+business-case/
+docs/
+sandbox/
+legacy/
+dashboard/
+.git/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv
+*.egg-info/
