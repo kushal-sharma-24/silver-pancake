@@ -1,0 +1,42 @@
+# Directories excluded from Docker build context
+business-case/
+docs/
+sandbox/
+legacy/
+dashboard/
+
+# Version control
+.git
+.github
+.gitignore
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment and secrets
+.env
+.env.*
+
+# Node
+node_modules/
+
+# IDE and OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Misc
+*.md
+!README.md
+*.code-workspace
+pipeline-docs/
+client/
